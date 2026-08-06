@@ -1,0 +1,16 @@
+dataset:
+  name: "COD10K"
+  raw_dir: "data/raw/COD10K"
+  processed_dir: "data/processed/COD10K"
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  input_size: [352, 352]
+  num_workers: 4
+  batch_size: 16
+
+benchmarks:
+  - name: "CAMO"
+    path: "data/raw/CAMO"
+  - name: "NC4K"
+    path: "data/raw/NC4K"
