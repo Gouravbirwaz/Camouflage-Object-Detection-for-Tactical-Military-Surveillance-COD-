@@ -1,0 +1,71 @@
+# DVC Pipeline Specification for COD Framework
+
+stages:
+  data_preparation:
+    cmd: python scripts/data_prep.py --config configs/data/cod10k.yaml
+    deps:
+      - scripts/data_prep.py
+      - data/raw
+    params:
+      - dataset.image_size
+      - dataset.train_split
+    outs:
+      - data/processed
+
+  train_dgnet:
+    cmd: python scripts/train.py --config configs/train.yaml
+    deps:
+      - scripts/train.py
+      - data/processed
+      - src/models
+    params:
+      - model.architecture
+      - train.epochs
+      - train.learning_rate
+      - train.lambda_grad_loss
+    outs:
+      - models/raw_checkpoints/dgnet_best.pt
+    metrics:
+      - metrics/train_metrics.json:
+          cache: false
+
+  prune_model:
+    cmd: python scripts/prune.py --config configs/optimization/int8_quantization.yaml
+    deps:
+      - scripts/prune.py
+      - models/raw_checkpoints/dgnet_best.pt
+    params:
+      - optimization.pruning.sparsity_ratio
+    outs:
+      - models/pruned/dgnet_pruned.pt
+
+  quantize_and_export_onnx:
+    cmd: python scripts/export_onnx.py --config configs/deployment/jetson_orin.yaml
+    deps:
+      - scripts/export_onnx.py
+      - models/pruned/dgnet_pruned.pt
+    params:
+      - deployment.precision
+      - deployment.onnx_opset_version
+    outs:
+      - models/quantized/dgnet_s_int8.onnx
+
+  build_tensorrt_engine:
+    cmd: python scripts/build_tensorrt.py --config configs/deployment/jetson_orin.yaml
+    deps:
+      - scripts/build_tensorrt.py
+      - models/quantized/dgnet_s_int8.onnx
+    params:
+      - deployment.tensorrt.workspace_size_mb
+    outs:
+      - models/tensorrt/dgnet_s_int8.engine
+
+  evaluate_edge_model:
+    cmd: python scripts/evaluate.py --config configs/deployment/jetson_orin.yaml
+    deps:
+      - scripts/evaluate.py
+      - models/tensorrt/dgnet_s_int8.engine
+      - data/processed
+    metrics:
+      - metrics/evaluation_results.json:
+          cache: false

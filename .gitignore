@@ -1,33 +1,84 @@
-# Python / Cache
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
+
+# C extensions
 *.so
+
+# Distribution / packaging
 .Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyTest & Coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+junit/
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints
+*-checkpoint.ipynb
+
+# Environments
+.env
+.venv
 env/
 venv/
-.venv/
+ENV/
+env.bak/
+venv.bak/
 
-# Jupyter Notebooks
-.ipynb_checkpoints
-
-# Datasets & Weights
-data/raw/*
-!data/raw/.gitkeep
-data/processed/*
-!data/processed/.gitkeep
-checkpoints/*
-!checkpoints/.gitkeep
-*.pth
-*.pt
-
-# IDEs & System
+# IDE / Editor Settings
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
+
+# Data directory contents (Tracked by DVC instead of Git)
+data/raw/*
+!data/raw/.gitkeep
+data/interim/*
+!data/interim/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+data/synthetic/*
+!data/synthetic/.gitkeep
+
+# Heavy Model Checkpoints & Optimized Runtimes (Tracked by DVC)
+models/raw_checkpoints/*.pt
+models/raw_checkpoints/*.pth
+models/pruned/*.pt
+models/quantized/*.onnx
+models/quantized/*.tflite
+models/onnx/*.onnx
+models/tensorrt/*.engine
+models/tensorrt/*.plan
+
+# TensorBoard & Experiment logs
+experiments/*
+!experiments/.gitkeep
+logs/
+*.log
+
+# OS generated files
 .DS_Store
 Thumbs.db
-
-# Build artifacts
-build/
-dist/
-*.egg-info/

@@ -1,0 +1,60 @@
+# Global DVC & Experiment Parameters
+
+dataset:
+  name: "COD10K_CAMO_NC4K"
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  image_size: [384, 384]
+  num_workers: 4
+  batch_size: 16
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+
+model:
+  architecture: "DGNet-S"
+  context_backbone: "efficientnet-b0" # Options: resnet50, efficientnet-b0
+  gradient_kernel: "sobel"            # Options: sobel, scharr, laplacian
+  num_classes: 1
+  pretrained: true
+
+train:
+  epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  optimizer: "adamw"
+  lr_scheduler: "cosine"
+  lambda_grad_loss: 1.5               # Weight balancing parameter lambda for gradient supervision loss
+
+optimization:
+  pruning:
+    enabled: true
+    method: "structured_channel"
+    sparsity_ratio: 0.3
+  quantization:
+    enabled: true
+    mode: "INT8"                       # Options: INT8, FP16, FP32
+    calibration_samples: 500
+  distillation:
+    teacher_model: "models/raw_checkpoints/dgnet_resnet50_best.pt"
+
+deployment:
+  target_platform: "jetson_orin"       # Options: jetson_orin, jetson_nano, raspberry_pi5, x86_gpu
+  precision: "int8"
+  max_batch_size: 1
+  onnx_opset_version: 17
+  tensorrt:
+    workspace_size_mb: 2048
+    dla_core: -1                      # -1 for GPU, 0/1 for DLA cores on Jetson Orin
+    output_engine_path: "models/tensorrt/dgnet_s_int8.engine"
+
+integration:
+  mavlink:
+    connection_string: "udp:127.0.0.1:14550"
+    baud_rate: 57600
+    target_system: 1
+    target_component: 1
+    alert_threshold_confidence: 0.75
+  api:
+    host: "0.0.0.0"
+    port: 8000

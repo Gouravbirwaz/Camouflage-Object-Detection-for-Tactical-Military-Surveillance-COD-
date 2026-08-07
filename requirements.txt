@@ -1,11 +1,5 @@
-torch>=2.0.0
-torchvision>=0.15.0
-numpy>=1.24.0
-opencv-python>=4.7.0
-albumentations>=1.3.0
-pillow>=9.5.0
-matplotlib>=3.7.0
-scipy>=1.10.0
-pyyaml>=6.0
-tqdm>=4.65.0
-pytest>=7.3.0
+# Production Camouflaged Object Detection Framework Requirements
+-r requirements/base.txt
+-r requirements/train.txt
+-r requirements/edge.txt
+-r requirements/dev.txt

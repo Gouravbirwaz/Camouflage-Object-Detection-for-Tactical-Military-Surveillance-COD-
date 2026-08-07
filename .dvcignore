@@ -1,0 +1,12 @@
+# DVC ignore rules
+.git/
+.hg/
+.svn/
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.env
+.venv
