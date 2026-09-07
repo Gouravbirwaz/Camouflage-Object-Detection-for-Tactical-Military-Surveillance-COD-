@@ -1,5 +1,19 @@
 # Production Camouflaged Object Detection Framework Requirements
--r requirements/base.txt
--r requirements/train.txt
--r requirements/edge.txt
--r requirements/dev.txt
+
+# Machine Learning & Deep Learning Core
+tensorflow>=2.16.0
+numpy
+pillow
+opencv-python
+matplotlib
+tqdm
+scikit-learn
+pyyaml
+python-dotenv
+
+# Data Version Control & Cloud Remote Storage (Hugging Face S3 Gateway)
+dvc[s3]
+boto3
+
+# Hugging Face Hub & Job Utilities
+huggingface_hub>=0.20.0

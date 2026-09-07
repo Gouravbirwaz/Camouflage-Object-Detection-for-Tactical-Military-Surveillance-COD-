@@ -1,7 +1,12 @@
-tensorflow==2.19.0
+tensorflow>=2.16.0
 numpy
 pillow
 opencv-python
 matplotlib
 tqdm
 scikit-learn
+pyyaml
+python-dotenv
+dvc[s3]
+boto3
+huggingface_hub>=0.20.0

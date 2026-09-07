@@ -37,14 +37,16 @@ junit/
 .ipynb_checkpoints
 *-checkpoint.ipynb
 
-# Environments
+# Environments & Secrets
 .env
+.dvc/config.local
 .venv
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+.env.example/
 
 # IDE / Editor Settings
 .vscode/
@@ -66,12 +68,15 @@ data/synthetic/*
 # Heavy Model Checkpoints & Optimized Runtimes (Tracked by DVC)
 models/raw_checkpoints/*.pt
 models/raw_checkpoints/*.pth
+models/raw_checkpoints/*.h5
+models/raw_checkpoints/*.keras
 models/pruned/*.pt
 models/quantized/*.onnx
 models/quantized/*.tflite
 models/onnx/*.onnx
 models/tensorrt/*.engine
 models/tensorrt/*.plan
+checkpoints/
 
 # TensorBoard & Experiment logs
 experiments/*

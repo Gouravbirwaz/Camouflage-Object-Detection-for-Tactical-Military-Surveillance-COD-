@@ -1,4 +1,8 @@
 [core]
-    remote = s3remote
+    remote = hf-bucket
 ['remote "s3remote"']
     url = s3://cod-project-data/dvc-storage
+['remote "hf-bucket"']
+    url = s3://COD_dataset/dvc-store
+    endpointurl = https://s3.hf.co/gouravbirwaz
+    region = us-east-1

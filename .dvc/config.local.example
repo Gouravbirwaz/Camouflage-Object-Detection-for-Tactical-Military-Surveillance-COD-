@@ -1,0 +1,7 @@
+# Example DVC Local Configuration for Hugging Face S3 Remote
+# Copy this content to .dvc/config.local and fill in your actual Hugging Face S3 credentials.
+# Do NOT commit .dvc/config.local to Git!
+
+['remote "hf-bucket"']
+    access_key_id = YOUR_HUGGINGFACE_S3_ACCESS_KEY_ID
+    secret_access_key = YOUR_HUGGINGFACE_S3_SECRET_ACCESS_KEY
