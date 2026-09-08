@@ -25,8 +25,8 @@ COPY params.yaml .
 COPY dvc.yaml .
 COPY entrypoint.sh .
 
-# Set permissions
-RUN chmod +x entrypoint.sh
+# Set permissions & sanitize Windows CRLF line endings
+RUN sed -i 's/\r$//' entrypoint.sh && chmod +x entrypoint.sh
 
 # Environment defaults
 ENV PYTHONUNBUFFERED=1
