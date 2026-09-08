@@ -264,7 +264,7 @@ def upload_logs(log_dir: str = None):
     print("[HF Sync] Log upload completed successfully!\n")
 
 
-def upload_dataset(data_dir: str = None):
+def upload_dataset(data_dir: str = None, zip_first: bool = True):
     if data_dir is None:
         data_dir = os.getenv("DATA_DIR", data_cfg.get("raw_data_dir", "data/raw/dataset-splitM"))
 
@@ -273,21 +273,42 @@ def upload_dataset(data_dir: str = None):
         print(f"[HF Sync] Dataset path {data_path.resolve()} does not exist.")
         return
 
-    print(f"\n[HF Sync] Uploading raw dataset folder from {data_path.resolve()} to '{REPO_ID}' (path_in_repo='data/raw')...")
     api = get_api()
     try:
         api.create_repo(repo_id=REPO_ID, repo_type="dataset", exist_ok=True, token=HF_TOKEN)
     except Exception as e:
         print(f"[HF Sync] Repository creation note: {e}")
 
-    api.upload_folder(
-        folder_path=str(data_path.resolve()),
-        path_in_repo="data/raw",
-        repo_id=REPO_ID,
-        repo_type="dataset",
-        token=HF_TOKEN
-    )
-    print("[HF Sync] Dataset upload completed successfully!\n")
+    if zip_first:
+        zip_file = PROJECT_ROOT / "data" / "dataset_raw.zip"
+        print(f"\n[HF Sync] Packaging dataset directory into single archive ({zip_file.name}) to optimize Hugging Face transfer...")
+        shutil.make_archive(str(zip_file.with_suffix("")), 'zip', root_dir=str(data_path.parent.resolve()), base_dir=data_path.name)
+        size_mb = zip_file.stat().st_size / (1024 * 1024)
+        print(f"[HF Sync] Uploading compressed dataset archive ({size_mb:.2f} MB) to '{REPO_ID}' (path_in_repo='data/dataset_raw.zip')...")
+        try:
+            api.upload_file(
+                path_or_fileobj=str(zip_file.resolve()),
+                path_in_repo="data/dataset_raw.zip",
+                repo_id=REPO_ID,
+                repo_type="dataset",
+                token=HF_TOKEN
+            )
+            print("[HF Sync] Compressed dataset archive uploaded successfully!\n")
+        except Exception as e:
+            print(f"[HF Sync] Archive upload notice: {e}")
+    else:
+        print(f"\n[HF Sync] Uploading raw dataset folder from {data_path.resolve()} to '{REPO_ID}' (path_in_repo='data/raw')...")
+        try:
+            api.upload_folder(
+                folder_path=str(data_path.resolve()),
+                path_in_repo="data/raw",
+                repo_id=REPO_ID,
+                repo_type="dataset",
+                token=HF_TOKEN
+            )
+            print("[HF Sync] Dataset upload completed successfully!\n")
+        except Exception as e:
+            print(f"[HF Sync] Dataset folder upload notice: {e}")
 
 
 def download_dataset(data_dir: str = None):
