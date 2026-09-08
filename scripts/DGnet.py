@@ -44,6 +44,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.models.dgnet import DGNet, DGNetLoss, build_dgnet_model, TFGradientExtractor
+from src.utils.config import load_project_config
 
 
 def setup_gpu_environment():
@@ -61,14 +62,10 @@ def setup_gpu_environment():
         print("\n[GPU Hardware Detection] No physical GPU detected by TensorFlow. Running on CPU.")
 
 
-def load_config(config_path: str = "params.yaml") -> dict:
-    """Loads configuration parameters from params.yaml."""
-    cfg_file = PROJECT_ROOT / config_path
-    if cfg_file.exists():
-        with open(cfg_file, "r") as f:
-            params = yaml.safe_load(f)
-        return params
-    return {}
+def load_config(config_path: str = None) -> dict:
+    """Loads configuration parameters dynamically from configs/ directory via central manager."""
+    return load_project_config(config_path)
+
 
 
 def _find_dataset_splits_in_dir(target_dir: Path, valid_exts: set) -> Dict[str, Tuple[List[str], List[str]]]:
@@ -373,13 +370,19 @@ def train_dgnet(
     backbone: str = "mobilenet_v3_large",
     kernel: str = "sobel",
     lambda_grad: float = 1.5,
-    resume: bool = False
+    resume: bool = False,
+    model_version: str = None
 ):
-    """Executes full model training on the dataset with checkpoint persistence and resume support."""
+    """Executes full model training on the dataset with checkpoint persistence, versioning, and resume support."""
     setup_gpu_environment()
 
     params = load_config("params.yaml")
     img_size = tuple(params.get("dataset", {}).get("image_size", [384, 384]))
+    
+    # Resolve model versioning tag
+    cfg = load_config()
+    version_str = model_version or cfg.get("train", {}).get("model_version") or cfg.get("model", {}).get("version", "v1.0")
+    version_tag = version_str if str(version_str).startswith("v") else f"v{version_str}"
 
     # Resolve configurable paths
     data_path = Path(data_dir) if Path(data_dir).is_absolute() else PROJECT_ROOT / data_dir
@@ -407,7 +410,7 @@ def train_dgnet(
         train_imgs, train_masks = all_imgs[:val_idx], all_masks[:val_idx]
         val_imgs, val_masks = all_imgs[val_idx:], all_masks[val_idx:]
 
-    print(f"\n[Training Setup] Training Samples: {len(train_imgs)} | Validation Samples: {len(val_imgs)}")
+    print(f"\n[Training Setup] Training Version: {version_tag} | Training Samples: {len(train_imgs)} | Validation Samples: {len(val_imgs)}")
 
     # 2. Build tf.data Datasets
     train_ds = create_tf_dataset(train_imgs, train_masks, image_size=img_size, batch_size=batch_size, is_train=True)
@@ -429,6 +432,12 @@ def train_dgnet(
     )
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
 
+    # Versioned and backward-compatible checkpoint paths
+    versioned_best_weights_path = ckpt_dir / f"dgnet_{version_tag}_best.weights.h5"
+    versioned_latest_weights_path = ckpt_dir / f"dgnet_{version_tag}_latest.weights.h5"
+    versioned_final_weights_path = ckpt_dir / f"dgnet_{version_tag}_final.weights.h5"
+    versioned_best_model_path = ckpt_dir / f"dgnet_{version_tag}_best_model.keras"
+
     best_weights_path = ckpt_dir / "dgnet_best.weights.h5"
     latest_weights_path = ckpt_dir / "dgnet_latest.weights.h5"
     final_weights_path = ckpt_dir / "dgnet_final.weights.h5"
@@ -439,7 +448,7 @@ def train_dgnet(
     dummy_x = tf.zeros((1, img_size[0], img_size[1], 3))
     _ = model(dummy_x, training=False)
 
-    # Checkpoint Resume Logic - Multi-candidate search
+    # Checkpoint Resume Logic - Multi-candidate search (versioned priority)
     if resume:
         candidate_dirs = [
             ckpt_dir,
@@ -453,14 +462,23 @@ def train_dgnet(
             try:
                 if not cdir.exists():
                     continue
-                for w_name in ["dgnet_latest.weights.h5", "dgnet_best.weights.h5", "dgnet_final.weights.h5"]:
+                # Priority search: target version -> generic versioned -> fallback static names
+                w_candidates = [
+                    f"dgnet_{version_tag}_latest.weights.h5",
+                    f"dgnet_{version_tag}_best.weights.h5",
+                    f"dgnet_{version_tag}_final.weights.h5",
+                    "dgnet_latest.weights.h5",
+                    "dgnet_best.weights.h5",
+                    "dgnet_final.weights.h5"
+                ]
+                for w_name in w_candidates:
                     wp = cdir / w_name
                     if wp.exists() and wp.stat().st_size > 0:
                         found_weights = wp
                         break
                 if found_weights:
                     break
-                for wp in cdir.glob("*.weights.h5"):
+                for wp in sorted(cdir.glob("*.weights.h5"), reverse=True):
                     if wp.is_file() and wp.stat().st_size > 0:
                         found_weights = wp
                         break
@@ -583,9 +601,15 @@ def train_dgnet(
         history["val_total_loss"].append(avg_val_loss)
         history["val_iou"].append(val_iou)
 
-        # Always update latest weights checkpoint after each epoch
+        # Always update latest weights checkpoint (versioned + fallback)
         try:
+            model.save_weights(str(versioned_latest_weights_path))
             model.save_weights(str(latest_weights_path))
+            
+            # Save periodic versioned epoch checkpoint every 5 epochs or on final epoch
+            if epoch % 5 == 0 or epoch == epochs:
+                epoch_ckpt_path = ckpt_dir / f"dgnet_{version_tag}_epoch_{epoch:03d}.weights.h5"
+                model.save_weights(str(epoch_ckpt_path))
         except Exception as e:
             print(f"  Notice (Checkpoint Save): {e}")
 
@@ -593,20 +617,25 @@ def train_dgnet(
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             try:
+                model.save_weights(str(versioned_best_weights_path))
+                model.save(str(versioned_best_model_path))
                 model.save_weights(str(best_weights_path))
                 model.save(str(best_model_path))
             except Exception:
                 pass
-            saved_str = " -> Best Checkpoint Saved!"
+            saved_str = f" -> Best Checkpoint ({version_tag}) Saved!"
 
         print(f"Epoch [{epoch:02d}/{epochs:02d}] ({epoch_time:.1f}s) | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val IoU: {val_iou:.4f}{saved_str}", flush=True)
 
         with open(metrics_log_path, "w") as f:
             json.dump(history, f, indent=4)
 
-    # Save final checkpoint
+    # Save final checkpoint (versioned + fallback)
     try:
+        model.save_weights(str(versioned_final_weights_path))
         model.save_weights(str(final_weights_path))
+        if not versioned_best_weights_path.exists() and versioned_latest_weights_path.exists():
+            shutil.copy2(str(versioned_latest_weights_path), str(versioned_best_weights_path))
         if not best_weights_path.exists() and latest_weights_path.exists():
             shutil.copy2(str(latest_weights_path), str(best_weights_path))
     except Exception as e:
@@ -616,7 +645,7 @@ def train_dgnet(
     fallback_ckpt_dir = PROJECT_ROOT / "models/raw_checkpoints"
     if ckpt_dir.resolve() != fallback_ckpt_dir.resolve():
         fallback_ckpt_dir.mkdir(parents=True, exist_ok=True)
-        for w_file in [latest_weights_path, best_weights_path, final_weights_path]:
+        for w_file in [versioned_latest_weights_path, versioned_best_weights_path, versioned_final_weights_path, versioned_best_model_path, latest_weights_path, best_weights_path, final_weights_path, best_model_path]:
             if w_file.exists():
                 try:
                     shutil.copy2(str(w_file), str(fallback_ckpt_dir / w_file.name))
@@ -635,12 +664,16 @@ def train_dgnet(
     print(f"[Metrics] Saved training history to: {metrics_log_path.resolve()}\n")
 
 
-def evaluate_dgnet(data_dir: str = "data/raw/dataset-splitM", checkpoint_dir: str = "models/raw_checkpoints", log_dir: str = "metrics", backbone: str = "mobilenet_v3_large", kernel: str = "sobel"):
+def evaluate_dgnet(data_dir: str = "data/raw/dataset-splitM", checkpoint_dir: str = "models/raw_checkpoints", log_dir: str = "metrics", backbone: str = "mobilenet_v3_large", kernel: str = "sobel", model_version: str = None):
     """Evaluates the trained model on test dataset split."""
     setup_gpu_environment()
 
     params = load_config("params.yaml")
     img_size = tuple(params.get("dataset", {}).get("image_size", [384, 384]))
+    
+    cfg = load_config()
+    version_str = model_version or cfg.get("train", {}).get("model_version") or cfg.get("model", {}).get("version", "v1.0")
+    version_tag = version_str if str(version_str).startswith("v") else f"v{version_str}"
 
     data_path = Path(data_dir) if Path(data_dir).is_absolute() else PROJECT_ROOT / data_dir
     ckpt_dir = Path(checkpoint_dir) if Path(checkpoint_dir).is_absolute() else PROJECT_ROOT / checkpoint_dir
@@ -651,12 +684,12 @@ def evaluate_dgnet(data_dir: str = "data/raw/dataset-splitM", checkpoint_dir: st
     test_key = "Testing" if "Testing" in splits else list(splits.keys())[0]
     test_imgs, test_masks = splits[test_key]
 
-    print(f"\n[Evaluation] Evaluating DGNet on split '{test_key}' ({len(test_imgs)} samples)...")
+    print(f"\n[Evaluation] Evaluating DGNet ({version_tag}) on split '{test_key}' ({len(test_imgs)} samples)...")
     test_ds = create_tf_dataset(test_imgs, test_masks, image_size=img_size, batch_size=4, is_train=False)
 
     model = build_dgnet_model(backbone_name=backbone, input_shape=(img_size[0], img_size[1], 3), gradient_kernel=kernel, pretrained=False)
 
-    # Multi-candidate search for weights
+    # Multi-candidate search for weights (versioned priority)
     candidate_dirs = [
         ckpt_dir,
         Path("/data/models/raw_checkpoints"),
@@ -664,13 +697,27 @@ def evaluate_dgnet(data_dir: str = "data/raw/dataset-splitM", checkpoint_dir: st
         PROJECT_ROOT / "models/raw_checkpoints"
     ]
     found_weights = None
+    w_candidates = [
+        f"dgnet_{version_tag}_best.weights.h5",
+        f"dgnet_{version_tag}_latest.weights.h5",
+        f"dgnet_{version_tag}_final.weights.h5",
+        "dgnet_best.weights.h5",
+        "dgnet_latest.weights.h5",
+        "dgnet_final.weights.h5"
+    ]
     for cdir in candidate_dirs:
         try:
             if not cdir.exists():
                 continue
-            for w_name in ["dgnet_best.weights.h5", "dgnet_latest.weights.h5", "dgnet_final.weights.h5"]:
+            for w_name in w_candidates:
                 wp = cdir / w_name
                 if wp.exists() and wp.stat().st_size > 0:
+                    found_weights = wp
+                    break
+            if found_weights:
+                break
+            for wp in sorted(cdir.glob("*.weights.h5"), reverse=True):
+                if wp.is_file() and wp.stat().st_size > 0:
                     found_weights = wp
                     break
             if found_weights:
@@ -758,28 +805,33 @@ def export_tflite(
 
 
 def main():
-    params = load_config("params.yaml")
-    model_cfg = params.get("model", {})
-    train_cfg = params.get("train", {})
+    cfg = load_project_config()
+    data_cfg = cfg.get("data", {})
+    model_cfg = cfg.get("model", {})
+    train_cfg = cfg.get("train", {})
 
     # Priority: Env Vars > Config Params > Default relative paths
-    env_data_dir = os.getenv("DATA_DIR", "data/raw/dataset-splitM")
-    env_model_dir = os.getenv("MODEL_DIR", "models")
-    env_ckpt_dir = os.getenv("CHECKPOINT_DIR", "models/raw_checkpoints")
-    env_log_dir = os.getenv("LOG_DIR", "metrics")
-    env_resume = os.getenv("RESUME", "false").lower() in ("true", "1", "t", "yes")
+    env_data_dir = os.getenv("DATA_DIR", data_cfg.get("raw_data_dir", "data/raw/dataset-splitM"))
+    env_model_dir = os.getenv("MODEL_DIR", train_cfg.get("model_dir", "models"))
+    env_ckpt_dir = os.getenv("CHECKPOINT_DIR", train_cfg.get("checkpoint_dir", "models/raw_checkpoints"))
+    env_log_dir = os.getenv("LOG_DIR", train_cfg.get("log_dir", "metrics"))
+    env_resume = train_cfg.get("resume", os.getenv("RESUME", "false").lower() in ("true", "1", "t", "yes"))
 
     default_backbone = model_cfg.get("context_backbone", "mobilenet_v3_large")
     default_kernel = model_cfg.get("gradient_kernel", "sobel")
-    default_img_size = tuple(params.get("dataset", {}).get("image_size", [384, 384]))
+    default_img_size = tuple(data_cfg.get("image_size", [384, 384]))
     default_epochs = train_cfg.get("epochs", 10)
-    default_batch_size = train_cfg.get("batch_size", params.get("dataset", {}).get("batch_size", 8))
+    default_batch_size = train_cfg.get("batch_size", data_cfg.get("batch_size", 8))
     default_lr = train_cfg.get("learning_rate", 0.001)
+    default_tflite_path = train_cfg.get("tflite_export_path", "models/quantized/dgnet_s_int8.tflite")
+
+    default_version = os.getenv("MODEL_VERSION", train_cfg.get("model_version", model_cfg.get("version", "v1.0")))
 
     parser = argparse.ArgumentParser(description="DGNet: Deep Gradient Network Real Model Training & Execution (TensorFlow 2.x)")
     parser.add_argument("--train", action="store_true", help="Execute real model training on dataset")
     parser.add_argument("--evaluate", action="store_true", help="Evaluate trained model on test dataset split")
     parser.add_argument("--resume", action="store_true", default=env_resume, help="Resume training from latest checkpoint in CHECKPOINT_DIR")
+    parser.add_argument("--version", "--model-version", type=str, default=default_version, help="Model version tag for checkpointing (e.g. v1.0)")
     parser.add_argument("--backbone", type=str, default=default_backbone, help="Backbone architecture")
     parser.add_argument("--kernel", type=str, default=default_kernel, help="Gradient kernel type")
     parser.add_argument("--epochs", type=int, default=default_epochs, help="Number of training epochs")
@@ -808,7 +860,8 @@ def main():
             log_dir=args.log_dir,
             backbone=args.backbone,
             kernel=args.kernel,
-            resume=args.resume
+            resume=args.resume,
+            model_version=args.version
         )
 
     if args.evaluate:
@@ -817,7 +870,8 @@ def main():
             checkpoint_dir=args.checkpoint_dir,
             log_dir=args.log_dir,
             backbone=args.backbone,
-            kernel=args.kernel
+            kernel=args.kernel,
+            model_version=args.version
         )
 
     if args.summary:
@@ -836,8 +890,9 @@ def main():
             gradient_kernel=args.kernel,
             pretrained=False
         )
-        out_path = args.output if args.output else os.path.join(args.model_dir, "quantized/dgnet_mobilenet_v3.tflite")
+        out_path = args.output if args.output else default_tflite_path
         export_tflite(model, output_path=out_path, image_size=default_img_size)
+
 
 
 if __name__ == "__main__":

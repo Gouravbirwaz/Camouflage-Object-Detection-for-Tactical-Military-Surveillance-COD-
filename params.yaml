@@ -13,6 +13,7 @@ dataset:
 
 model:
   architecture: "DGNet-S"
+  version: "v1.0"
   context_backbone: "efficientnet-b0" # Options: resnet50, efficientnet-b0
   gradient_kernel: "sobel"            # Options: sobel, scharr, laplacian
   num_classes: 1

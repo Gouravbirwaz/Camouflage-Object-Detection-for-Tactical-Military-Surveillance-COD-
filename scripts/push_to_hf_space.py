@@ -19,6 +19,10 @@ except ImportError:
     pass
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.utils.config import load_project_config
 
 try:
     from huggingface_hub import HfApi
@@ -28,9 +32,16 @@ except ImportError:
 
 
 def main():
+    cfg = load_project_config()
+    hf_cfg = cfg.get("huggingface", {})
+
+    default_space_id = os.getenv("HF_SPACE_ID", hf_cfg.get("space_id", "gouravbirwaz/cod_training"))
+    default_token = os.getenv("HF_TOKEN", hf_cfg.get("token", None))
+    space_sdk = hf_cfg.get("space_sdk", "docker")
+
     parser = argparse.ArgumentParser(description="Push COD_PROJECT code to Hugging Face Space (Docker SDK)")
-    parser.add_argument("--space-id", type=str, default=os.getenv("HF_SPACE_ID", "gouravbirwaz/cod_training"), help="HF Space ID (e.g. gouravbirwaz/cod_training)")
-    parser.add_argument("--token", type=str, default=os.getenv("HF_TOKEN", None), help="Hugging Face write token")
+    parser.add_argument("--space-id", type=str, default=default_space_id, help="HF Space ID (e.g. gouravbirwaz/cod_training)")
+    parser.add_argument("--token", type=str, default=default_token, help="Hugging Face write token")
 
     args = parser.parse_args()
 
@@ -58,7 +69,7 @@ def main():
             api.create_repo(
                 repo_id=space_id,
                 repo_type="space",
-                space_sdk="docker",
+                space_sdk=space_sdk,
                 exist_ok=True,
                 token=token
             )

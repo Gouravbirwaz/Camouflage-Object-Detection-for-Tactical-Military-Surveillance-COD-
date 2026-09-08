@@ -1,0 +1,5 @@
+context_backbone: "mobilenet_v3_large"
+gradient_kernel: "sobel"
+feature_channels: 64
+pretrained: false
+lambda_loss: 0.5

@@ -21,19 +21,35 @@ except ImportError:
     pass
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.utils.config import load_project_config
 
 
-def generate_job_command(epochs: int = 50, batch_size: int = 16, resume: bool = False, flavor: str = "a100-large") -> str:
-    hf_token = os.getenv("HF_TOKEN", "<YOUR_HF_TOKEN>")
-    repo_id = os.getenv("HF_REPO_ID", "gouravbirwaz/COD_dataset")
+def generate_job_command(epochs: int = None, batch_size: int = None, resume: bool = False, flavor: str = None) -> str:
+    cfg = load_project_config()
+    hf_cfg = cfg.get("huggingface", {})
+    train_cfg = cfg.get("train", {})
+    data_cfg = cfg.get("data", {})
+
+    flavor = flavor or hf_cfg.get("hardware_flavor", "a100-large")
+    epochs = epochs if epochs is not None else train_cfg.get("epochs", 10)
+    batch_size = batch_size if batch_size is not None else train_cfg.get("batch_size", data_cfg.get("batch_size", 8))
+
+    hf_token = os.getenv("HF_TOKEN", hf_cfg.get("token", "<YOUR_HF_TOKEN>"))
+    repo_id = os.getenv("HF_REPO_ID", hf_cfg.get("repo_id", "gouravbirwaz/COD_dataset"))
+    data_dir = os.getenv("DATA_DIR", data_cfg.get("raw_data_dir", "data/raw/dataset-splitM"))
+    checkpoint_dir = os.getenv("CHECKPOINT_DIR", train_cfg.get("checkpoint_dir", "models/raw_checkpoints"))
+    log_dir = os.getenv("LOG_DIR", train_cfg.get("log_dir", "metrics"))
 
     resume_flag = "--resume" if resume else ""
 
     container_cmd = (
         f"pip install -r requirements.txt && "
-        f"python scripts/hf_sync.py --download-checkpoints --ckpt-dir models/raw_checkpoints --download-dataset && "
+        f"python scripts/hf_sync.py --download-checkpoints --ckpt-dir {checkpoint_dir} --download-dataset && "
         f"python scripts/DGnet.py --train --epochs {epochs} --batch-size {batch_size} {resume_flag} && "
-        f"python scripts/hf_sync.py --upload-checkpoints --ckpt-dir models/raw_checkpoints --upload-logs --log-dir metrics"
+        f"python scripts/hf_sync.py --upload-checkpoints --ckpt-dir {checkpoint_dir} --upload-logs --log-dir {log_dir}"
     )
 
     hf_cli_cmd = (
@@ -41,9 +57,9 @@ def generate_job_command(epochs: int = 50, batch_size: int = 16, resume: bool = 
         f"  --flavor {flavor} \\\n"
         f"  --env HF_TOKEN={hf_token} \\\n"
         f"  --env HF_REPO_ID={repo_id} \\\n"
-        f"  --env DATA_DIR=data/raw/dataset-splitM \\\n"
-        f"  --env CHECKPOINT_DIR=models/raw_checkpoints \\\n"
-        f"  --env LOG_DIR=metrics \\\n"
+        f"  --env DATA_DIR={data_dir} \\\n"
+        f"  --env CHECKPOINT_DIR={checkpoint_dir} \\\n"
+        f"  --env LOG_DIR={log_dir} \\\n"
         f"  --command \"{container_cmd}\""
     )
 
@@ -51,10 +67,19 @@ def generate_job_command(epochs: int = 50, batch_size: int = 16, resume: bool = 
 
 
 def main():
+    cfg = load_project_config()
+    hf_cfg = cfg.get("huggingface", {})
+    train_cfg = cfg.get("train", {})
+    data_cfg = cfg.get("data", {})
+
+    default_flavor = hf_cfg.get("hardware_flavor", "a100-large")
+    default_epochs = train_cfg.get("epochs", 10)
+    default_batch_size = train_cfg.get("batch_size", data_cfg.get("batch_size", 8))
+
     parser = argparse.ArgumentParser(description="Hugging Face A100 GPU Job Helper")
-    parser.add_argument("--flavor", type=str, default="a100-large", help="HF Hardware flavor (e.g., a100-large, a100-small, t4-medium)")
-    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs to train on GPU")
-    parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
+    parser.add_argument("--flavor", type=str, default=default_flavor, help="HF Hardware flavor (e.g., a100-large, a100-small, t4-medium)")
+    parser.add_argument("--epochs", type=int, default=default_epochs, help="Number of epochs to train on GPU")
+    parser.add_argument("--batch-size", type=int, default=default_batch_size, help="Batch size")
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint")
 
     args = parser.parse_args()

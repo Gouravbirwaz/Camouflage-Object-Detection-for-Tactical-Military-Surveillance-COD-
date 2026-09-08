@@ -37,6 +37,15 @@ except ImportError:
     pass
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.utils.config import load_project_config
+
+cfg = load_project_config()
+hf_cfg = cfg.get("huggingface", {})
+train_cfg = cfg.get("train", {})
+data_cfg = cfg.get("data", {})
 
 try:
     from huggingface_hub import HfApi, login, upload_file, upload_folder, hf_hub_download, snapshot_download
@@ -45,8 +54,8 @@ except ImportError:
     sys.exit(1)
 
 
-REPO_ID = os.getenv("HF_REPO_ID", "gouravbirwaz/COD_dataset")
-HF_TOKEN = os.getenv("HF_TOKEN", None)
+REPO_ID = os.getenv("HF_REPO_ID", hf_cfg.get("repo_id", "gouravbirwaz/COD_dataset"))
+HF_TOKEN = os.getenv("HF_TOKEN", hf_cfg.get("token", None))
 
 if HF_TOKEN is not None:
     HF_TOKEN = HF_TOKEN.strip()
@@ -60,6 +69,7 @@ def get_api():
     return HfApi()
 
 
+
 def _resolve_path(path_str: str) -> Path:
     p = Path(path_str)
     return p if p.is_absolute() else PROJECT_ROOT / p
@@ -67,7 +77,7 @@ def _resolve_path(path_str: str) -> Path:
 
 def upload_checkpoints(ckpt_dir: str = None):
     if ckpt_dir is None:
-        ckpt_dir = os.getenv("CHECKPOINT_DIR", "models/raw_checkpoints")
+        ckpt_dir = os.getenv("CHECKPOINT_DIR", train_cfg.get("checkpoint_dir", "models/raw_checkpoints"))
 
     primary_path = _resolve_path(ckpt_dir)
 
@@ -77,6 +87,7 @@ def upload_checkpoints(ckpt_dir: str = None):
         Path("/app/models/raw_checkpoints"),
         PROJECT_ROOT / "models/raw_checkpoints",
     ]
+
 
     # Collect unique candidate paths that exist
     existing_dirs = []
@@ -156,7 +167,7 @@ def upload_checkpoints(ckpt_dir: str = None):
 
 def download_checkpoints(ckpt_dir: str = None):
     if ckpt_dir is None:
-        ckpt_dir = os.getenv("CHECKPOINT_DIR", "models/raw_checkpoints")
+        ckpt_dir = os.getenv("CHECKPOINT_DIR", train_cfg.get("checkpoint_dir", "models/raw_checkpoints"))
 
     primary_path = _resolve_path(ckpt_dir)
     primary_path.mkdir(parents=True, exist_ok=True)
@@ -204,7 +215,8 @@ def download_checkpoints(ckpt_dir: str = None):
 
 def upload_logs(log_dir: str = None):
     if log_dir is None:
-        log_dir = os.getenv("LOG_DIR", "metrics")
+        log_dir = os.getenv("LOG_DIR", train_cfg.get("log_dir", "metrics"))
+
 
     primary_path = _resolve_path(log_dir)
 
@@ -254,7 +266,7 @@ def upload_logs(log_dir: str = None):
 
 def upload_dataset(data_dir: str = None):
     if data_dir is None:
-        data_dir = os.getenv("DATA_DIR", "data/raw")
+        data_dir = os.getenv("DATA_DIR", data_cfg.get("raw_data_dir", "data/raw/dataset-splitM"))
 
     data_path = _resolve_path(data_dir)
     if not data_path.exists():
@@ -280,7 +292,7 @@ def upload_dataset(data_dir: str = None):
 
 def download_dataset(data_dir: str = None):
     if data_dir is None:
-        data_dir = os.getenv("DATA_DIR", "data/raw")
+        data_dir = os.getenv("DATA_DIR", data_cfg.get("raw_data_dir", "data/raw/dataset-splitM"))
 
     data_path = _resolve_path(data_dir)
     data_path.mkdir(parents=True, exist_ok=True)
@@ -300,9 +312,10 @@ def download_dataset(data_dir: str = None):
 
 
 def main():
-    env_data_dir = os.getenv("DATA_DIR", "data/raw")
-    env_ckpt_dir = os.getenv("CHECKPOINT_DIR", "models/raw_checkpoints")
-    env_log_dir = os.getenv("LOG_DIR", "metrics")
+    env_data_dir = os.getenv("DATA_DIR", data_cfg.get("raw_data_dir", "data/raw/dataset-splitM"))
+    env_ckpt_dir = os.getenv("CHECKPOINT_DIR", train_cfg.get("checkpoint_dir", "models/raw_checkpoints"))
+    env_log_dir = os.getenv("LOG_DIR", train_cfg.get("log_dir", "metrics"))
+
 
     parser = argparse.ArgumentParser(description="Hugging Face Storage Bucket Synchronization Helper")
     parser.add_argument("--upload-checkpoints", action="store_true", help="Upload local model checkpoints to HF Storage Bucket")

@@ -1,0 +1,12 @@
+raw_data_dir: "data/raw/dataset-splitM"
+splits:
+  - "Training"
+  - "Testing"
+batch_size: 8
+image_size: [384, 384]
+valid_extensions:
+  - ".jpg"
+  - ".jpeg"
+  - ".png"
+  - ".bmp"
+  - ".webp"
