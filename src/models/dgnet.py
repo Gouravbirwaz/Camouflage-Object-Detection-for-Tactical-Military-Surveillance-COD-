@@ -288,20 +288,25 @@ class PartialDecoder(layers.Layer):
     Partial Decoder Component (PDC):
     Progressively aggregates multi-scale context features (C1, C2, C3, C4)
     and texture features (T) to predict camouflage mask and edge gradient maps.
+    Includes Dropout before prediction heads to reduce overfitting.
     """
 
-    def __init__(self, channels: int = 64, num_classes: int = 1, **kwargs):
+    def __init__(self, channels: int = 64, num_classes: int = 1, dropout_rate: float = 0.3, **kwargs):
         super().__init__(**kwargs)
         self.ncb3 = NeighborConnectionBlock(channels)
         self.ncb2 = NeighborConnectionBlock(channels)
         self.ncb1 = NeighborConnectionBlock(channels)
         self.texture_ncb = NeighborConnectionBlock(channels)
 
+        # Dropout before prediction heads to reduce overfitting
+        self.feat_dropout = layers.Dropout(dropout_rate)
+
         # Output prediction heads
         self.mask_head = models.Sequential([
             layers.Conv2D(channels // 2, kernel_size=3, padding="same", use_bias=False),
             layers.BatchNormalization(),
             layers.ReLU(),
+            layers.Dropout(dropout_rate / 2),
             layers.Conv2D(num_classes, kernel_size=1)
         ])
 
@@ -309,17 +314,21 @@ class PartialDecoder(layers.Layer):
             layers.Conv2D(channels // 2, kernel_size=3, padding="same", use_bias=False),
             layers.BatchNormalization(),
             layers.ReLU(),
+            layers.Dropout(dropout_rate / 2),
             layers.Conv2D(1, kernel_size=1)
         ])
 
-    def call(self, c1: tf.Tensor, c2: tf.Tensor, c3: tf.Tensor, c4: tf.Tensor, texture_feat: tf.Tensor, target_shape: Tuple[int, int]) -> Tuple[tf.Tensor, tf.Tensor]:
+    def call(self, c1: tf.Tensor, c2: tf.Tensor, c3: tf.Tensor, c4: tf.Tensor, texture_feat: tf.Tensor, target_shape: Tuple[int, int], training: Optional[bool] = None) -> Tuple[tf.Tensor, tf.Tensor]:
         f3 = self.ncb3(c4, c3)
         f2 = self.ncb2(f3, c2)
         f1 = self.ncb1(f2, c1)
         final_feat = self.texture_ncb(f1, texture_feat)
 
-        mask_logits = tf.image.resize(self.mask_head(final_feat), size=target_shape, method="bilinear")
-        grad_logits = tf.image.resize(self.grad_head(final_feat), size=target_shape, method="bilinear")
+        # Apply dropout before prediction heads (active only during training)
+        final_feat = self.feat_dropout(final_feat, training=training)
+
+        mask_logits = tf.image.resize(self.mask_head(final_feat, training=training), size=target_shape, method="bilinear")
+        grad_logits = tf.image.resize(self.grad_head(final_feat, training=training), size=target_shape, method="bilinear")
 
         return mask_logits, grad_logits
 
@@ -337,7 +346,7 @@ class DGNet(models.Model):
         gradient_kernel: str = "sobel",
         num_classes: int = 1,
         feature_channels: int = 64,
-        pretrained: bool = True,
+        pretrained: bool = True,                                
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -363,7 +372,7 @@ class DGNet(models.Model):
         texture_feat = self.texture_branch(grad_map, c1)
 
         # 4. Partial Decoder Component Fusion
-        mask_logits, grad_logits = self.decoder(c1, c2, c3, c4, texture_feat, target_shape=target_shape)
+        mask_logits, grad_logits = self.decoder(c1, c2, c3, c4, texture_feat, target_shape=target_shape, training=training)
 
         if training or return_dict:
             return {
@@ -379,12 +388,15 @@ class DGNetLoss(losses.Loss):
     """
     Multi-Task Supervision Loss Function for DGNet in TensorFlow:
     Loss_total = Loss_segmentation + lambda_grad * Loss_gradient
+
+    Includes label smoothing to improve generalization.
     """
 
-    def __init__(self, lambda_grad_loss: float = 1.5, name: str = "dgnet_loss", **kwargs):
+    def __init__(self, lambda_grad_loss: float = 1.5, label_smoothing: float = 0.05, name: str = "dgnet_loss", **kwargs):
         super().__init__(name=name, **kwargs)
         self.lambda_grad_loss = lambda_grad_loss
-        self.bce = losses.BinaryCrossentropy(from_logits=True, reduction=tf.keras.losses.Reduction.SUM_OVER_BATCH_SIZE)
+        self.label_smoothing = label_smoothing
+        self.bce = losses.BinaryCrossentropy(from_logits=True, label_smoothing=label_smoothing, reduction=tf.keras.losses.Reduction.SUM_OVER_BATCH_SIZE)
         self.mae = losses.MeanAbsoluteError(reduction=tf.keras.losses.Reduction.SUM_OVER_BATCH_SIZE)
 
     def _weighted_bce_iou_loss(self, y_true: tf.Tensor, y_pred_logits: tf.Tensor) -> tf.Tensor:

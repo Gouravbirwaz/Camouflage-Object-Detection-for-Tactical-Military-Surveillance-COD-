@@ -45,6 +45,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.models.dgnet import DGNet, DGNetLoss, build_dgnet_model, TFGradientExtractor
 from src.utils.config import load_project_config
+from src.utils.metrics import CODMetricsAccumulator
 
 
 def setup_gpu_environment():
@@ -323,12 +324,30 @@ def create_tf_dataset(
         dataset = dataset.shuffle(buffer_size=min(len(image_paths), 1000), seed=42)
 
         def _augment_fn(img, mask, grad_gt):
+            # Random horizontal flip
             if tf.random.uniform(()) > 0.5:
                 img = tf.image.flip_left_right(img)
                 mask = tf.image.flip_left_right(mask)
                 grad_gt = tf.image.flip_left_right(grad_gt)
-            img = tf.image.random_brightness(img, max_delta=0.15)
-            img = tf.image.random_contrast(img, lower=0.8, upper=1.2)
+            # Random vertical flip
+            if tf.random.uniform(()) > 0.5:
+                img = tf.image.flip_up_down(img)
+                mask = tf.image.flip_up_down(mask)
+                grad_gt = tf.image.flip_up_down(grad_gt)
+            # Random 90-degree rotation
+            k = tf.random.uniform((), minval=0, maxval=4, dtype=tf.int32)
+            img = tf.image.rot90(img, k=k)
+            mask = tf.image.rot90(mask, k=k)
+            grad_gt = tf.image.rot90(grad_gt, k=k)
+            # Color jitter (only on image)
+            img = tf.image.random_brightness(img, max_delta=0.2)
+            img = tf.image.random_contrast(img, lower=0.75, upper=1.25)
+            img = tf.image.random_saturation(img, lower=0.8, upper=1.2)
+            img = tf.image.random_hue(img, max_delta=0.05)
+            # Gaussian noise
+            if tf.random.uniform(()) > 0.5:
+                noise = tf.random.normal(tf.shape(img), mean=0.0, stddev=0.02)
+                img = img + noise
             img = tf.clip_by_value(img, 0.0, 1.0)
             return img, mask, grad_gt
 
@@ -426,11 +445,29 @@ def train_dgnet(
     )
     loss_fn = DGNetLoss(lambda_grad_loss=lambda_grad)
 
-    lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
-        initial_learning_rate=learning_rate,
-        decay_steps=epochs * len(train_ds)
-    )
-    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+    # Learning rate with linear warmup + cosine decay to prevent instability
+    total_steps = epochs * len(train_ds)
+    warmup_steps = min(5 * len(train_ds), total_steps // 5)  # Warmup for 5 epochs or 20% of training
+
+    class WarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
+        def __init__(self, initial_lr, warmup_steps, total_steps):
+            super().__init__()
+            self.initial_lr = initial_lr
+            self.warmup_steps = float(warmup_steps)
+            self.total_steps = float(total_steps)
+            self.cosine_decay = tf.keras.optimizers.schedules.CosineDecay(
+                initial_learning_rate=initial_lr,
+                decay_steps=int(total_steps - warmup_steps)
+            )
+
+        def __call__(self, step):
+            step = tf.cast(step, tf.float32)
+            warmup_lr = self.initial_lr * (step / tf.maximum(self.warmup_steps, 1.0))
+            cosine_lr = self.cosine_decay(step - self.warmup_steps)
+            return tf.where(step < self.warmup_steps, warmup_lr, cosine_lr)
+
+    lr_schedule = WarmupCosineDecay(learning_rate, warmup_steps, total_steps)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule, clipnorm=1.0)
 
     # Versioned and backward-compatible checkpoint paths
     versioned_best_weights_path = ckpt_dir / f"dgnet_{version_tag}_best.weights.h5"
@@ -495,10 +532,29 @@ def train_dgnet(
             print(f"\n[Resume Training] Notice: Resume flag set, but no checkpoint found in candidate locations. Starting fresh training.")
 
     best_val_loss = float("inf")
-    history = {"train_total_loss": [], "val_total_loss": [], "val_iou": []}
+    best_val_iou = 0.0
+    best_val_iou_epoch = 0
+    best_val_loss_epoch = 0
+    early_stop_patience = 10
+    epochs_without_improvement = 0
+
+    history = {
+        "train_total_loss": [],
+        "val_total_loss": [],
+        "val_iou": [],
+        "val_mae": [],
+        "val_dice": [],
+        "val_f_measure": [],
+        "val_precision": [],
+        "val_recall": [],
+        "val_pixel_accuracy": [],
+        "val_fpr": [],
+        "val_fnr": [],
+    }
 
     print("\n" + "=" * 70)
     print(f"             Starting DGNet Real Model Training ({epochs} Epochs)")
+    print(f"             Early Stopping Patience: {early_stop_patience} epochs")
     print("=" * 70)
 
     # 4. Compiled Step Functions & Warmup
@@ -526,10 +582,7 @@ def train_dgnet(
         }
         v_loss = loss_fn(y_m, val_preds_dict)
         prob_mask = tf.nn.sigmoid(val_preds["mask_pred"])
-        pred_bin = tf.cast(prob_mask >= 0.5, tf.float32)
-        inter = tf.reduce_sum(pred_bin * y_m)
-        union = tf.reduce_sum(pred_bin + y_m) - inter
-        return v_loss, inter, union
+        return v_loss, prob_mask
 
     print("\n[Training Setup] Compiling @tf.function model graph...", flush=True)
     for w_x, w_y, w_g in train_ds.take(1):
@@ -572,34 +625,42 @@ def train_dgnet(
 
         avg_train_loss = train_loss_sum / num_batches if num_batches > 0 else 0.0
 
+        # Validation with comprehensive metrics
         val_loss_sum = 0.0
         val_batches = 0
-        intersection_sum = 0.0
-        union_sum = 0.0
+        metrics_acc = CODMetricsAccumulator(threshold=0.5, beta_sq=0.3)
 
         if use_tqdm:
             val_pbar = tqdm(val_ds, total=total_val_batches, desc=f"Epoch {epoch:02d}/{epochs:02d} [Val]  ", leave=False)
             for x_val, y_val_mask, y_val_grad in val_pbar:
-                v_loss, inter, union = val_step(x_val, y_val_mask, y_val_grad)
+                v_loss, prob_mask = val_step(x_val, y_val_mask, y_val_grad)
                 val_loss_sum += float(v_loss)
-                intersection_sum += float(inter)
-                union_sum += float(union)
                 val_batches += 1
+                metrics_acc.update(y_val_mask, prob_mask)
         else:
             for x_val, y_val_mask, y_val_grad in val_ds:
-                v_loss, inter, union = val_step(x_val, y_val_mask, y_val_grad)
+                v_loss, prob_mask = val_step(x_val, y_val_mask, y_val_grad)
                 val_loss_sum += float(v_loss)
-                intersection_sum += float(inter)
-                union_sum += float(union)
                 val_batches += 1
+                metrics_acc.update(y_val_mask, prob_mask)
 
         avg_val_loss = val_loss_sum / val_batches if val_batches > 0 else 0.0
-        val_iou = (intersection_sum + 1.0) / (union_sum + 1.0)
+        epoch_metrics = metrics_acc.result()
 
         epoch_time = time.time() - epoch_start
+
+        # Record all metrics
         history["train_total_loss"].append(avg_train_loss)
         history["val_total_loss"].append(avg_val_loss)
-        history["val_iou"].append(val_iou)
+        history["val_iou"].append(epoch_metrics["iou"])
+        history["val_mae"].append(epoch_metrics["mae"])
+        history["val_dice"].append(epoch_metrics["dice"])
+        history["val_f_measure"].append(epoch_metrics["f_measure"])
+        history["val_precision"].append(epoch_metrics["precision"])
+        history["val_recall"].append(epoch_metrics["recall"])
+        history["val_pixel_accuracy"].append(epoch_metrics["pixel_accuracy"])
+        history["val_fpr"].append(epoch_metrics["fpr"])
+        history["val_fnr"].append(epoch_metrics["fnr"])
 
         # Always update latest weights checkpoint (versioned + fallback)
         try:
@@ -613,9 +674,12 @@ def train_dgnet(
         except Exception as e:
             print(f"  Notice (Checkpoint Save): {e}")
 
+        # Track best val loss for early stopping
         saved_str = ""
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
+            best_val_loss_epoch = epoch
+            epochs_without_improvement = 0
             try:
                 model.save_weights(str(versioned_best_weights_path))
                 model.save(str(versioned_best_model_path))
@@ -624,11 +688,28 @@ def train_dgnet(
             except Exception:
                 pass
             saved_str = f" -> Best Checkpoint ({version_tag}) Saved!"
+        else:
+            epochs_without_improvement += 1
 
-        print(f"Epoch [{epoch:02d}/{epochs:02d}] ({epoch_time:.1f}s) | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val IoU: {val_iou:.4f}{saved_str}", flush=True)
+        # Track best IoU
+        if epoch_metrics["iou"] > best_val_iou:
+            best_val_iou = epoch_metrics["iou"]
+            best_val_iou_epoch = epoch
+
+        # Print comprehensive epoch summary
+        print(f"Epoch [{epoch:02d}/{epochs:02d}] ({epoch_time:.1f}s) | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}{saved_str}", flush=True)
+        print(f"  -> Pixel Acc: {epoch_metrics['pixel_accuracy']*100:.2f}% | IoU: {epoch_metrics['iou']:.4f} | Dice: {epoch_metrics['dice']:.4f} | MAE: {epoch_metrics['mae']:.4f}", flush=True)
+        print(f"  -> F-measure: {epoch_metrics['f_measure']:.4f} | Precision: {epoch_metrics['precision']:.4f} | Recall: {epoch_metrics['recall']:.4f}", flush=True)
+        print(f"  -> FPR: {epoch_metrics['fpr']:.4f} | FNR: {epoch_metrics['fnr']:.4f}", flush=True)
 
         with open(metrics_log_path, "w") as f:
             json.dump(history, f, indent=4)
+
+        # Early stopping check
+        if epochs_without_improvement >= early_stop_patience:
+            print(f"\n[Early Stopping] No improvement in val loss for {early_stop_patience} epochs. Stopping training.")
+            print(f"[Early Stopping] Best val loss: {best_val_loss:.4f} at epoch {best_val_loss_epoch}")
+            break
 
     # Save final checkpoint (versioned + fallback)
     try:
@@ -653,11 +734,64 @@ def train_dgnet(
                     pass
 
     total_training_time = time.time() - start_train_time
+
+    # ==================== COMPREHENSIVE FINAL TRAINING REPORT ====================
+    final_epoch = len(history["train_total_loss"])
+    best_dice = max(history["val_dice"]) if history["val_dice"] else 0.0
+    best_dice_epoch = (history["val_dice"].index(best_dice) + 1) if history["val_dice"] else 0
+    best_fm = max(history["val_f_measure"]) if history["val_f_measure"] else 0.0
+    best_fm_epoch = (history["val_f_measure"].index(best_fm) + 1) if history["val_f_measure"] else 0
+    best_acc = max(history["val_pixel_accuracy"]) if history["val_pixel_accuracy"] else 0.0
+    best_acc_epoch = (history["val_pixel_accuracy"].index(best_acc) + 1) if history["val_pixel_accuracy"] else 0
+
+    print("\n" + "=" * 70)
+    print("            FINAL TRAINING REPORT - DGNet COD")
     print("=" * 70)
-    print(f" Training Completed in {total_training_time / 60.0:.2f} minutes!")
-    print(f" Best Validation Loss: {best_val_loss:.4f}")
-    print(f" Checkpoint Location:  {ckpt_dir.resolve()}")
+    print(f"  Training Time:          {total_training_time / 60.0:.2f} minutes ({final_epoch} epochs)")
+    print(f"  Model Version:          {version_tag}")
+    print(f"  Backbone:               {backbone}")
+    print("-" * 70)
+    print(f"  Best Val Loss:          {best_val_loss:.4f} (epoch {best_val_loss_epoch})")
+    print(f"  Best IoU:               {best_val_iou:.4f} (epoch {best_val_iou_epoch})")
+    print(f"  Best Dice:              {best_dice:.4f} (epoch {best_dice_epoch})")
+    print(f"  Best F-measure:         {best_fm:.4f} (epoch {best_fm_epoch})")
+    print(f"  Best Pixel Accuracy:    {best_acc*100:.2f}% (epoch {best_acc_epoch})")
+    print("-" * 70)
+    print(f"  Final Train Loss:       {history['train_total_loss'][-1]:.4f}")
+    print(f"  Final Val Loss:         {history['val_total_loss'][-1]:.4f}")
+    print(f"  Final MAE:              {history['val_mae'][-1]:.4f}")
+    print(f"  Final FPR (False Pos):  {history['val_fpr'][-1]:.4f}")
+    print(f"  Final FNR (False Neg):  {history['val_fnr'][-1]:.4f}")
+    print(f"  Final Precision:        {history['val_precision'][-1]:.4f}")
+    print(f"  Final Recall:           {history['val_recall'][-1]:.4f}")
+    print("-" * 70)
+    print(f"  Overfitting Gap:        {history['val_total_loss'][-1] - history['train_total_loss'][-1]:.4f} (val - train)")
+    if epochs_without_improvement >= early_stop_patience:
+        print(f"  Early Stopped:          Yes (at epoch {final_epoch})")
+    else:
+        print(f"  Early Stopped:          No (completed all {epochs} epochs)")
+    print(f"  Checkpoint Location:    {ckpt_dir.resolve()}")
     print("=" * 70 + "\n")
+
+    # Save final summary as part of metrics
+    history["final_summary"] = {
+        "training_time_minutes": round(total_training_time / 60.0, 2),
+        "total_epochs_run": final_epoch,
+        "best_val_loss": round(best_val_loss, 6),
+        "best_val_loss_epoch": best_val_loss_epoch,
+        "best_val_iou": round(best_val_iou, 6),
+        "best_val_iou_epoch": best_val_iou_epoch,
+        "best_dice": round(best_dice, 6),
+        "best_f_measure": round(best_fm, 6),
+        "best_pixel_accuracy": round(best_acc, 6),
+        "final_train_loss": round(history['train_total_loss'][-1], 6),
+        "final_val_loss": round(history['val_total_loss'][-1], 6),
+        "final_mae": round(history['val_mae'][-1], 6),
+        "final_fpr": round(history['val_fpr'][-1], 6),
+        "final_fnr": round(history['val_fnr'][-1], 6),
+        "overfitting_gap": round(history['val_total_loss'][-1] - history['train_total_loss'][-1], 6),
+        "early_stopped": epochs_without_improvement >= early_stop_patience,
+    }
 
     with open(metrics_log_path, "w") as f:
         json.dump(history, f, indent=4)
@@ -732,25 +866,38 @@ def evaluate_dgnet(data_dir: str = "data/raw/dataset-splitM", checkpoint_dir: st
     else:
         print(f"[Evaluation] Warning: No trained weights checkpoint found. Evaluating with initialized model.")
 
-    mae_sum = 0.0
-    count = 0
+    metrics_acc = CODMetricsAccumulator(threshold=0.5, beta_sq=0.3)
     start_time = time.perf_counter()
 
     for x_batch, y_mask, _ in test_ds:
         pred_mask = model(x_batch, training=False)
-        mae = tf.reduce_mean(tf.abs(pred_mask - y_mask))
-        mae_sum += float(mae) * len(x_batch)
-        count += len(x_batch)
+        metrics_acc.update(y_mask, pred_mask)
 
     total_time = time.perf_counter() - start_time
-    avg_mae = mae_sum / count if count > 0 else 0.0
-    fps = count / total_time if total_time > 0 else 0.0
+    eval_metrics = metrics_acc.result()
+    fps = eval_metrics["sample_count"] / total_time if total_time > 0 else 0.0
 
     eval_results = {
         "dataset_split": test_key,
-        "sample_count": count,
-        "mean_absolute_error_mae": round(avg_mae, 4),
-        "evaluation_fps": round(fps, 1)
+        "sample_count": eval_metrics["sample_count"],
+        "pixel_accuracy": eval_metrics["pixel_accuracy"],
+        "mean_absolute_error_mae": eval_metrics["mae"],
+        "iou": eval_metrics["iou"],
+        "dice": eval_metrics["dice"],
+        "f_measure": eval_metrics["f_measure"],
+        "precision": eval_metrics["precision"],
+        "recall": eval_metrics["recall"],
+        "specificity": eval_metrics["specificity"],
+        "false_positive_rate": eval_metrics["fpr"],
+        "false_negative_rate": eval_metrics["fnr"],
+        "confusion_matrix": {
+            "true_positives": eval_metrics["tp_total"],
+            "true_negatives": eval_metrics["tn_total"],
+            "false_positives": eval_metrics["fp_total"],
+            "false_negatives": eval_metrics["fn_total"],
+        },
+        "evaluation_fps": round(fps, 1),
+        "evaluation_time_seconds": round(total_time, 2),
     }
 
     eval_log_path = metrics_log_dir / "evaluation_results.json"
@@ -758,12 +905,29 @@ def evaluate_dgnet(data_dir: str = "data/raw/dataset-splitM", checkpoint_dir: st
         json.dump(eval_results, f, indent=4)
 
     print("\n" + "=" * 70)
-    print("                    DGNet Evaluation Metrics")
+    print("            DGNet Comprehensive Evaluation Report")
     print("=" * 70)
-    print(f" Test Set Samples:       {count}")
-    print(f" Mean Absolute Error:    {avg_mae:.4f}")
-    print(f" Realtime Speed:         {fps:.1f} FPS")
-    print(f" Saved Evaluation JSON:  {eval_log_path.resolve()}")
+    print(f"  Test Split:             {test_key} ({eval_metrics['sample_count']} samples)")
+    print(f"  Model Version:          {version_tag}")
+    print("-" * 70)
+    print(f"  Pixel Accuracy:         {eval_metrics['pixel_accuracy']*100:.2f}%")
+    print(f"  Mean Absolute Error:    {eval_metrics['mae']:.4f}")
+    print(f"  IoU (Jaccard):          {eval_metrics['iou']:.4f}")
+    print(f"  Dice Coefficient:       {eval_metrics['dice']:.4f}")
+    print(f"  F-measure (Fβ=0.3):    {eval_metrics['f_measure']:.4f}")
+    print("-" * 70)
+    print(f"  Precision:              {eval_metrics['precision']:.4f}")
+    print(f"  Recall:                 {eval_metrics['recall']:.4f}")
+    print(f"  Specificity:            {eval_metrics['specificity']:.4f}")
+    print(f"  False Positive Rate:    {eval_metrics['fpr']:.4f}")
+    print(f"  False Negative Rate:    {eval_metrics['fnr']:.4f}")
+    print("-" * 70)
+    print(f"  Confusion Matrix:")
+    print(f"    TP: {eval_metrics['tp_total']:.0f}  |  FP: {eval_metrics['fp_total']:.0f}")
+    print(f"    FN: {eval_metrics['fn_total']:.0f}  |  TN: {eval_metrics['tn_total']:.0f}")
+    print("-" * 70)
+    print(f"  Realtime Speed:         {fps:.1f} FPS")
+    print(f"  Saved Evaluation JSON:  {eval_log_path.resolve()}")
     print("=" * 70 + "\n")
 
 
