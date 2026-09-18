@@ -38,7 +38,8 @@ ENV CHECKPOINT_DIR=models/raw_checkpoints
 ENV LOG_DIR=metrics
 ENV EPOCHS=50
 ENV BATCH_SIZE=16
-ENV RESUME=true
+ENV RESUME=false
+ENV MODEL_VERSION=v2.0_official_dgnet
 
 # MLflow Experiment Tracking & S3 Artifact Defaults
 ENV MLFLOW_TRACKING_URI=http://44.211.142.88:5000

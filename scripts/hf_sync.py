@@ -327,9 +327,48 @@ def download_dataset(data_dir: str = None):
             allow_patterns="data/*",
             token=HF_TOKEN
         )
-        print("[HF Sync] Dataset synced successfully!\n")
+        print("[HF Sync] Dataset snapshot synced successfully!")
     except Exception as e:
-        print(f"[HF Sync] Dataset sync notice: {e}")
+        print(f"[HF Sync] Dataset snapshot download notice: {e}")
+
+    # Check if dataset archive exists or needs downloading
+    has_images = any(data_path.rglob("*.jpg")) or any(data_path.rglob("*.png"))
+    if not has_images:
+        zip_candidates = [
+            PROJECT_ROOT / "data" / "dataset_raw.zip",
+            PROJECT_ROOT / "dataset_raw.zip",
+            data_path.parent / "dataset_raw.zip"
+        ]
+        found_zip = None
+        for zc in zip_candidates:
+            if zc.exists() and zc.stat().st_size > 0:
+                found_zip = zc
+                break
+
+        if not found_zip:
+            print("[HF Sync] Local dataset missing images. Attempting direct download of 'data/dataset_raw.zip'...")
+            try:
+                downloaded_zip = hf_hub_download(
+                    repo_id=REPO_ID,
+                    repo_type="dataset",
+                    filename="data/dataset_raw.zip",
+                    local_dir=str(PROJECT_ROOT),
+                    token=HF_TOKEN
+                )
+                found_zip = Path(downloaded_zip)
+            except Exception as dl_err:
+                print(f"[HF Sync] Direct zip download notice: {dl_err}")
+
+        if found_zip and found_zip.exists():
+            print(f"[HF Sync] Extracting dataset archive {found_zip}...")
+            import zipfile
+            extract_target = data_path.parent if data_path.name == "dataset-splitM" else data_path
+            extract_target.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(found_zip, "r") as zf:
+                zf.extractall(extract_target)
+            print(f"[HF Sync] Dataset successfully extracted to {extract_target.resolve()}!\n")
+        else:
+            print(f"[HF Sync] Notice: No dataset zip found or extracted. Checking if dataset files exist in {data_path.resolve()}...")
 
 
 def main():

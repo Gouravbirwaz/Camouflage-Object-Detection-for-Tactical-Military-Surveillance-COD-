@@ -513,14 +513,11 @@ def train_dgnet(
             try:
                 if not cdir.exists():
                     continue
-                # Priority search: target version -> generic versioned -> fallback static names
+                # Search only for current version weights to prevent loading mismatched architectures
                 w_candidates = [
                     f"dgnet_{version_tag}_latest.weights.h5",
                     f"dgnet_{version_tag}_best.weights.h5",
                     f"dgnet_{version_tag}_final.weights.h5",
-                    "dgnet_latest.weights.h5",
-                    "dgnet_best.weights.h5",
-                    "dgnet_final.weights.h5"
                 ]
                 for w_name in w_candidates:
                     wp = cdir / w_name
@@ -529,21 +526,19 @@ def train_dgnet(
                         break
                 if found_weights:
                     break
-                for wp in sorted(cdir.glob("*.weights.h5"), reverse=True):
-                    if wp.is_file() and wp.stat().st_size > 0:
-                        found_weights = wp
-                        break
-                if found_weights:
-                    break
             except Exception:
                 continue
 
         if found_weights:
-            print(f"\n[Resume Training] Found checkpoint weights: {found_weights.resolve()}")
-            model.load_weights(str(found_weights))
-            print("[Resume Training] Checkpoint weights loaded successfully! Continuing training...")
+            print(f"\n[Resume Training] Found compatible checkpoint weights for {version_tag}: {found_weights.resolve()}")
+            try:
+                model.load_weights(str(found_weights))
+                print(f"[Resume Training] Successfully loaded checkpoint weights from {found_weights.name}!")
+            except Exception as load_err:
+                print(f"[Resume Training] Warning: Failed to load weights from {found_weights.name}: {load_err}")
+                print(f"[Resume Training] Starting fresh training from scratch for version '{version_tag}'.")
         else:
-            print(f"\n[Resume Training] Notice: Resume flag set, but no checkpoint found in candidate locations. Starting fresh training.")
+            print(f"\n[Resume Training] Notice: Resume requested, but no existing checkpoints found for version '{version_tag}'. Starting fresh training.")
 
     best_val_loss = float("inf")
     best_val_iou = 0.0

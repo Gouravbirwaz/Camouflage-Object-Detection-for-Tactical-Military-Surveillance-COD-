@@ -45,9 +45,17 @@ mkdir -p "$LOG_DIR_RESOLVED"
 mkdir -p "models/raw_checkpoints"
 mkdir -p "metrics"
 
+# Start background web health check server on port 7860 for HF Space
+python3 scripts/space_monitor.py &
+MONITOR_PID=$!
+echo "[Space Monitor] Started web server on PID $MONITOR_PID (port ${PORT:-7860})"
+echo "[Worker Initializing] Setting up environment and storage..." > /tmp/training_status.txt
+
 # 1. DVC Dataset Checkout & Checkpoint Sync from HF Storage Bucket
 echo ""
 echo "[Step 1/3] Syncing latest checkpoints and dataset from HF Storage Bucket..."
+echo "[Step 1/3] Syncing dataset and checkpoints from Hugging Face..." > /tmp/training_status.txt
+
 if [ -d "/data/dvc-store" ] || [ -d "/data/files" ]; then
     echo "  • Detected mounted DVC storage bucket at /data. Running DVC checkout..."
     dvc config cache.dir /data/dvc-store 2>/dev/null || true
@@ -60,6 +68,8 @@ python3 scripts/hf_sync.py --download-checkpoints --ckpt-dir "$CKPT_DIR_RESOLVED
 # 2. Run DGNet Training
 echo ""
 echo "[Step 2/3] Launching DGNet TensorFlow GPU Training..."
+echo "[Step 2/3] DGNet GPU Training in progress (Epochs: ${EPOCHS:-50}, Version: ${MODEL_VERSION:-v2.0_official_dgnet})..." > /tmp/training_status.txt
+
 RESUME_FLAG=""
 if [ "$RESUME" = "true" ] || [ "$RESUME" = "1" ]; then
     RESUME_FLAG="--resume"
@@ -79,9 +89,15 @@ python3 scripts/DGnet.py \
 # 3. Upload Checkpoints and Logs back to HF Storage Bucket
 echo ""
 echo "[Step 3/3] Uploading trained checkpoints and metrics back to HF Bucket..."
+echo "[Step 3/3] Uploading trained checkpoints and metrics to Hugging Face..." > /tmp/training_status.txt
+
 python3 scripts/hf_sync.py --upload-checkpoints --ckpt-dir "$CKPT_DIR_RESOLVED" --upload-logs --log-dir "$LOG_DIR_RESOLVED" || echo "Notice: Upload completed with notes."
 
 echo "======================================================================"
 echo " 🎉 GPU Training Completed Successfully! Checkpoints Saved & Synced."
 echo "======================================================================"
+echo "[Complete] GPU Training Completed Successfully! Checkpoints saved & synced to gouravbirwaz/COD_dataset." > /tmp/training_status.txt
+
+# Keep container alive to serve dashboard and avoid restart loop
+wait $MONITOR_PID
 
