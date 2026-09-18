@@ -1,0 +1,43 @@
+================================================================================
+DGNet PROBLEM REPORT: INVERTED MASK / REVERSED POLARITY
+Date: 2026-09-14
+Component: tests/test_model_inference.py, models/raw_checkpoints/dgnet_v1.0_latest.weights.h5
+================================================================================
+
+1. WHAT HAPPENED (SYMPTOMS)
+--------------------------------------------------------------------------------
+When running inference on test images (e.g. image504.jpg, image545.jpg):
+- The model successfully detects the exact shape, arms, and head of the sniper.
+- HOWEVER, the colors are completely inverted:
+    * The camouflage target is colored BLACK (0.0 confidence).
+    * The entire background (trees, foliage, grass) is colored WHITE (1.0 confidence).
+- In the comparison overlay, the entire forest turns red, while the soldier is 
+  left completely unhighlighted (carved out like a hollow cutout).
+- Average prediction across the image is 76% to 91% white, instead of the 
+  expected 10% to 20% for camouflage targets.
+
+
+2. WHY THIS HAPPENED (ROOT CAUSE)
+--------------------------------------------------------------------------------
+This is known as "Reversed Polarity" or "Inverted Segmentation".
+
+Here is the simple explanation of why it occurred:
+
+Step 1: The Starting Point (The Corrupted Checkpoint)
+  The previous training checkpoint (epoch 50) had collapsed into all-zeros.
+  Its final layer was outputting strong negative numbers (-11 to -14 everywhere).
+
+Step 2: Resuming Training with the New Loss
+  When training was resumed from that checkpoint with the new structure loss 
+  (which heavily penalizes missed targets), the optimizer needed to push 
+  activations out of the deep negative zone immediately.
+
+Step 3: The "Inverted Shortcut"
+  Because background covers 85% to 90% of the image, the easiest mathematical 
+  path for the optimizer was to push background activations to positive (+1), 
+  while leaving the target activations negative (0).
+
+Result:
+  The neural network successfully learned the features and boundaries of the 
+  camouflage target, but assigned it the WRONG SIGN (0 instead of 1).
+================================================================================

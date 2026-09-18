@@ -17,3 +17,6 @@ boto3
 
 # Hugging Face Hub & Job Utilities
 huggingface_hub>=0.20.0
+
+# Experiment Tracking & Metadata Logging
+mlflow>=2.10.0

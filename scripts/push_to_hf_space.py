@@ -48,11 +48,7 @@ def main():
     token = args.token.strip() if args.token and args.token.strip() else None
     space_id = args.space_id
 
-    if not token:
-        print("Error: HF_TOKEN is required. Set it in .env or pass --token YOUR_TOKEN")
-        sys.exit(1)
-
-    api = HfApi(token=token)
+    api = HfApi(token=token) if token else HfApi()
 
     print(f"\n[HF Space Deploy] Checking Hugging Face Space '{space_id}'...")
 
@@ -99,6 +95,8 @@ def main():
         "data/*",
         "models/*",
         "metrics/*",
+        "mlruns/*",
+        "mlartifacts/*",
         "__pycache__/*",
         "*.pyc",
         "*.pdf",

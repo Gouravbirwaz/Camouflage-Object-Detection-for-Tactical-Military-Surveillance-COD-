@@ -84,6 +84,11 @@ experiments/*
 logs/
 *.log
 
+# MLflow Experiment Tracking Local Files
+mlruns/
+mlartifacts/
+.trash/
+
 # OS generated files
 .DS_Store
 Thumbs.db

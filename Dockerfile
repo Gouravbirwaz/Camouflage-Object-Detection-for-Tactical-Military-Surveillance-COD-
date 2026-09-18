@@ -14,7 +14,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy requirements and install Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir --ignore-installed blinker && \
+    pip install --no-cache-dir -r requirements.txt
 
 # Copy project source files and dataset
 COPY src/ ./src/
@@ -37,6 +39,15 @@ ENV LOG_DIR=metrics
 ENV EPOCHS=50
 ENV BATCH_SIZE=16
 ENV RESUME=true
+
+# MLflow Experiment Tracking & S3 Artifact Defaults
+ENV MLFLOW_TRACKING_URI=http://44.211.142.88:5000
+ENV MLFLOW_EXPERIMENT_NAME=COD-Camouflage-Detection
+ENV MLFLOW_S3_ENDPOINT_URL=https://s3.hf.co/gouravbirwaz
+ENV AWS_ENDPOINT_URL_S3=https://s3.hf.co/gouravbirwaz
+ENV MLFLOW_ARTIFACT_LOCATION=s3://COD_dataset/dvc-store/mlflow-artifacts
+ENV HF_S3_URI=s3://COD_dataset/dvc-store
+ENV AWS_DEFAULT_REGION=us-east-1
 
 # Expose port for HF Space health checks
 EXPOSE 7860

@@ -30,6 +30,15 @@ fi
 export CHECKPOINT_DIR="$CKPT_DIR_RESOLVED"
 export LOG_DIR="$LOG_DIR_RESOLVED"
 
+# MLflow Experiment Tracking & Hugging Face S3 Gateway Defaults
+export MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-http://44.211.142.88:5000}"
+export MLFLOW_EXPERIMENT_NAME="${MLFLOW_EXPERIMENT_NAME:-COD-Camouflage-Detection}"
+export MLFLOW_S3_ENDPOINT_URL="${MLFLOW_S3_ENDPOINT_URL:-https://s3.hf.co/gouravbirwaz}"
+export AWS_ENDPOINT_URL_S3="${AWS_ENDPOINT_URL_S3:-https://s3.hf.co/gouravbirwaz}"
+export MLFLOW_ARTIFACT_LOCATION="${MLFLOW_ARTIFACT_LOCATION:-s3://COD_dataset/dvc-store/mlflow-artifacts}"
+export HF_S3_URI="${HF_S3_URI:-s3://COD_dataset/dvc-store}"
+export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+
 # Ensure all candidate checkpoint & log directories exist
 mkdir -p "$CKPT_DIR_RESOLVED"
 mkdir -p "$LOG_DIR_RESOLVED"

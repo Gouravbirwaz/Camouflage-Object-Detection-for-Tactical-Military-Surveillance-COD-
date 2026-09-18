@@ -1,0 +1,60 @@
+================================================================================
+DGNet MODEL FAILURE REPORT: FOREGROUND COLLAPSE (ALL-BLACK MASK PREDICTION)
+Date: 2026-09-13
+Component: src/models/dgnet.py, scripts/DGnet.py, tests/test_model_inference.py
+Affected Checkpoint: models/raw_checkpoints/dgnet_v1.0_epoch_050.weights.h5
+================================================================================
+
+1. INCIDENT OVERVIEW & SYMPTOMS
+--------------------------------------------------------------------------------
+During model testing and evaluation (e.g. running tests/test_model_inference.py 
+on test set images such as image501.jpg):
+- The predicted mask (Panel 3 of image501_comparison.png) is completely pitch black.
+- The red detection overlay (Panel 4) has no highlighted regions.
+- The generated PNG files (image501_pred_mask.png and image501_pred_prob.png) are 
+  only ~222 bytes each, indicating a solid uniform array of all zeros.
+- The model fails to detect any camouflaged targets across the test split.
+
+
+2. NUMERICAL MEASUREMENTS (CHECKPOINT DIAGNOSTIC)
+--------------------------------------------------------------------------------
+Direct inspection of the raw model output for image501.jpg and other test images:
+- Output Logits (Pre-Sigmoid):
+    Min:   -13.7408
+    Max:   -6.9264
+    Mean:  -11.4663
+    Percentile 90:  -9.9864
+    Percentile 99:  -7.2092
+- Output Probabilities (Post-Sigmoid):
+    Min:   1.0776e-06  (0.0001%)
+    Max:   9.8053e-04  (0.0980%)
+    Mean:  4.1121e-05  (0.0041%)
+
+Observation:
+The maximum probability output across all 384x384 pixels is less than 0.1%.
+When applying the standard binarization threshold (threshold = 0.5), exactly 
+100% of pixels evaluate to 0 (background), resulting in an entirely blank/black mask.
+
+
+3. ROOT CAUSE ANALYSIS (FOREGROUND COLLAPSE)
+--------------------------------------------------------------------------------
+This is a documented pathology in semantic segmentation and camouflage detection 
+known as "Foreground Collapse" (or "Background Bias Trap"):
+
+a) Extreme Class Imbalance:
+   In Camouflaged Object Detection (COD) datasets (COD10K, CAMO, NC4K), background 
+   pixels represent 85% to 95% of total image pixels, while camouflaged targets 
+   occupy only 5% to 15%.
+
+b) Unweighted Loss Local Optimum:
+   With standard unweighted Binary Cross-Entropy (BCE) loss, the model discovers 
+   that outputting large negative logits (-10 to -14) everywhere instantly minimizes 
+   loss over the vast majority of pixels. It achieves ~90% pixel accuracy with almost 
+   zero background penalty, trapping the optimizer in a degenerate local minimum.
+
+c) Sigmoid Gradient Saturation:
+   For logits z <= -7, the sigmoid derivative d/dz sigma(z) = sigma(z) * (1 - sigma(z)) 
+   approaches zero (< 0.0009). The gradients flowing back from missed positive pixels 
+   vanish, making it nearly impossible for the optimizer (Adam/AdamW) to pull the 
+   weights out of the negative-logit regime once collapsed.
+

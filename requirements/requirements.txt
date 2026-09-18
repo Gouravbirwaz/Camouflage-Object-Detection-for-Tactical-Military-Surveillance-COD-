@@ -10,3 +10,4 @@ python-dotenv
 dvc[s3]
 boto3
 huggingface_hub>=0.20.0
+mlflow>=2.10.0

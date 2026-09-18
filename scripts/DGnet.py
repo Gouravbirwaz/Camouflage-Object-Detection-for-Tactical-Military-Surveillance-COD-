@@ -46,6 +46,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.models.dgnet import DGNet, DGNetLoss, build_dgnet_model, TFGradientExtractor
 from src.utils.config import load_project_config
 from src.utils.metrics import CODMetricsAccumulator
+from src.tracking.mlflow_utils import MLflowTracker
 
 
 def setup_gpu_environment():
@@ -382,15 +383,17 @@ def print_model_summary(model: DGNet, image_size: tuple = (384, 384)):
 def train_dgnet(
     epochs: int = 10,
     batch_size: int = 8,
-    learning_rate: float = 0.001,
+    learning_rate: float = 0.0001,
     data_dir: str = "data/raw/dataset-splitM",
     checkpoint_dir: str = "models/raw_checkpoints",
     log_dir: str = "metrics",
     backbone: str = "mobilenet_v3_large",
     kernel: str = "sobel",
-    lambda_grad: float = 1.5,
+    lambda_grad: float = 1.0,
     resume: bool = False,
-    model_version: str = None
+    model_version: str = None,
+    experiment_name: str = None,
+    enable_mlflow: bool = True
 ):
     """Executes full model training on the dataset with checkpoint persistence, versioning, and resume support."""
     setup_gpu_environment()
@@ -467,7 +470,7 @@ def train_dgnet(
             return tf.where(step < self.warmup_steps, warmup_lr, cosine_lr)
 
     lr_schedule = WarmupCosineDecay(learning_rate, warmup_steps, total_steps)
-    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule, clipnorm=1.0)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule, clipnorm=0.5)
 
     # Versioned and backward-compatible checkpoint paths
     versioned_best_weights_path = ckpt_dir / f"dgnet_{version_tag}_best.weights.h5"
@@ -537,6 +540,63 @@ def train_dgnet(
     best_val_loss_epoch = 0
     early_stop_patience = 10
     epochs_without_improvement = 0
+
+    # Initialize MLflow experiment tracking (configured via MLFLOW_TRACKING_URI env var)
+    mlflow_tracker = MLflowTracker(
+        experiment_name=experiment_name,
+        enabled=enable_mlflow
+    )
+    mlflow_tracker.start_run(
+        run_name=f"DGNet-{version_tag}-{backbone}",
+        tags={
+            "model_version": version_tag,
+            "backbone": backbone,
+            "gradient_kernel": kernel,
+            "resumed": str(resume)
+        },
+        description=f"DGNet COD training run for version {version_tag} with {backbone} backbone."
+    )
+
+    mlflow_tracker.log_params({
+        "model_name": "DGNet",
+        "model_architecture": "DGNet",
+        "model_version": version_tag,
+        "context_backbone": backbone,
+        "gradient_kernel": kernel,
+        "image_size": f"[{img_size[0]}, {img_size[1]}]",
+        "batch_size": batch_size,
+        "epochs": epochs,
+        "learning_rate": learning_rate,
+        "optimizer": "Adam",
+        "learning_rate_scheduler": "WarmupCosineDecay",
+        "gradient_clipnorm": 0.5,
+        "loss_function": "DGNetLoss (StructureLoss + MSE)",
+        "lambda_grad_loss": lambda_grad,
+        "random_seed": 42,
+        "dataset_name": params.get("dataset", {}).get("name", "COD10K_CAMO_NC4K"),
+        "train_samples": len(train_imgs),
+        "val_samples": len(val_imgs),
+        "early_stop_patience": early_stop_patience,
+        "resume_training": resume,
+        "dataset_path": str(data_path.resolve()),
+        "checkpoint_dir": str(ckpt_dir.resolve()),
+        "augmentation_horizontal_flip": True,
+        "augmentation_vertical_flip": True,
+        "augmentation_rotation_90": True,
+        "augmentation_color_jitter": True,
+        "augmentation_gaussian_noise": True,
+        "training_environment": os.getenv("TRAINING_PLATFORM", "huggingface"),
+    })
+
+    # Log configuration files as MLflow artifacts
+    config_candidates = [
+        PROJECT_ROOT / "params.yaml",
+        PROJECT_ROOT / "configs/data/data.yaml",
+        PROJECT_ROOT / "configs/model/dgnet.yaml",
+        PROJECT_ROOT / "configs/optimization/train.yaml",
+        PROJECT_ROOT / "configs/deployment/huggingface.yaml",
+    ]
+    mlflow_tracker.log_configs([str(cp) for cp in config_candidates if cp.exists()])
 
     history = {
         "train_total_loss": [],
@@ -705,6 +765,21 @@ def train_dgnet(
         with open(metrics_log_path, "w") as f:
             json.dump(history, f, indent=4)
 
+        # Log epoch metrics to MLflow
+        mlflow_tracker.log_metrics({
+            "train_total_loss": avg_train_loss,
+            "val_total_loss": avg_val_loss,
+            "val_iou": epoch_metrics["iou"],
+            "val_mae": epoch_metrics["mae"],
+            "val_dice": epoch_metrics["dice"],
+            "val_f_measure": epoch_metrics["f_measure"],
+            "val_precision": epoch_metrics["precision"],
+            "val_recall": epoch_metrics["recall"],
+            "val_pixel_accuracy": epoch_metrics["pixel_accuracy"],
+            "val_fpr": epoch_metrics["fpr"],
+            "val_fnr": epoch_metrics["fnr"],
+        }, step=epoch)
+
         # Early stopping check
         if epochs_without_improvement >= early_stop_patience:
             print(f"\n[Early Stopping] No improvement in val loss for {early_stop_patience} epochs. Stopping training.")
@@ -796,6 +871,32 @@ def train_dgnet(
     with open(metrics_log_path, "w") as f:
         json.dump(history, f, indent=4)
     print(f"[Metrics] Saved training history to: {metrics_log_path.resolve()}\n")
+
+    # Record metadata references to DVC/S3 checkpoints and summary metrics in MLflow
+    best_weights_resolved = versioned_best_weights_path if versioned_best_weights_path.exists() else best_weights_path
+    mlflow_tracker.log_checkpoint_metadata(
+        best_weights_path=str(best_weights_resolved) if best_weights_resolved.exists() else None,
+        best_epoch=best_val_loss_epoch,
+        best_val_loss=best_val_loss,
+        best_val_iou=best_val_iou,
+        best_val_dice=best_dice,
+        s3_bucket_uri=os.getenv("HF_S3_URI", "s3://COD_dataset/dvc-store"),
+        dvc_remote="hf-bucket"
+    )
+    # Log final summary metrics
+    mlflow_tracker.log_metrics({
+        "final_train_loss": float(history['train_total_loss'][-1]) if history['train_total_loss'] else 0.0,
+        "final_val_loss": float(history['val_total_loss'][-1]) if history['val_total_loss'] else 0.0,
+        "best_val_loss": float(best_val_loss),
+        "best_val_iou": float(best_val_iou),
+        "best_dice": float(best_dice),
+        "best_f_measure": float(best_fm),
+        "best_pixel_accuracy": float(best_acc),
+        "training_time_minutes": float(round(total_training_time / 60.0, 2)),
+    })
+    if metrics_log_path.exists():
+        mlflow_tracker.log_artifact(str(metrics_log_path.resolve()), artifact_path="metrics")
+    mlflow_tracker.end_run(status="FINISHED")
 
 
 def evaluate_dgnet(data_dir: str = "data/raw/dataset-splitM", checkpoint_dir: str = "models/raw_checkpoints", log_dir: str = "metrics", backbone: str = "mobilenet_v3_large", kernel: str = "sobel", model_version: str = None):
@@ -986,7 +1087,7 @@ def main():
     default_img_size = tuple(data_cfg.get("image_size", [384, 384]))
     default_epochs = train_cfg.get("epochs", 10)
     default_batch_size = train_cfg.get("batch_size", data_cfg.get("batch_size", 8))
-    default_lr = train_cfg.get("learning_rate", 0.001)
+    default_lr = train_cfg.get("learning_rate", 0.0001)
     default_tflite_path = train_cfg.get("tflite_export_path", "models/quantized/dgnet_s_int8.tflite")
 
     default_version = os.getenv("MODEL_VERSION", train_cfg.get("model_version", model_cfg.get("version", "v1.0")))
@@ -1008,6 +1109,8 @@ def main():
     parser.add_argument("--summary", action="store_true", help="Print model summary and parameter stats")
     parser.add_argument("--export-tflite", action="store_true", help="Export model to TensorFlow Lite format")
     parser.add_argument("--output", type=str, default=None, help="Custom output filepath for export/checkpoint")
+    parser.add_argument("--experiment-name", type=str, default=None, help="MLflow experiment name (or via MLFLOW_EXPERIMENT_NAME env var)")
+    parser.add_argument("--no-mlflow", action="store_true", help="Disable MLflow tracking for this run")
 
     args = parser.parse_args()
 
@@ -1025,7 +1128,9 @@ def main():
             backbone=args.backbone,
             kernel=args.kernel,
             resume=args.resume,
-            model_version=args.version
+            model_version=args.version,
+            experiment_name=args.experiment_name,
+            enable_mlflow=not args.no_mlflow
         )
 
     if args.evaluate:

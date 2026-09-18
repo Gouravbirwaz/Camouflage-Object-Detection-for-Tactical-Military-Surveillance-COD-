@@ -46,11 +46,34 @@ def generate_job_command(epochs: int = None, batch_size: int = None, resume: boo
     resume_flag = "--resume" if resume else ""
 
     container_cmd = (
+        f"pip install --no-cache-dir --ignore-installed blinker && "
         f"pip install -r requirements.txt && "
         f"python scripts/hf_sync.py --download-checkpoints --ckpt-dir {checkpoint_dir} --download-dataset && "
         f"python scripts/DGnet.py --train --epochs {epochs} --batch-size {batch_size} {resume_flag} && "
         f"python scripts/hf_sync.py --upload-checkpoints --ckpt-dir {checkpoint_dir} --upload-logs --log-dir {log_dir}"
     )
+
+    # Forward MLflow tracking, auth, and S3 artifact storage environment variables if configured
+    mlflow_env_lines = []
+    forward_env_vars = [
+        "MLFLOW_TRACKING_URI",
+        "MLFLOW_EXPERIMENT_NAME",
+        "MLFLOW_TRACKING_USERNAME",
+        "MLFLOW_TRACKING_PASSWORD",
+        "MLFLOW_TRACKING_TOKEN",
+        "MLFLOW_S3_ENDPOINT_URL",
+        "AWS_ENDPOINT_URL_S3",
+        "MLFLOW_ARTIFACT_LOCATION",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_DEFAULT_REGION",
+        "HF_S3_URI",
+    ]
+    for env_var in forward_env_vars:
+        val = os.getenv(env_var)
+        if val:
+            mlflow_env_lines.append(f"  --env {env_var}={val} \\")
+    mlflow_envs_str = ("\n".join(mlflow_env_lines) + "\n") if mlflow_env_lines else ""
 
     hf_cli_cmd = (
         f"hf job run \\\n"
@@ -60,6 +83,7 @@ def generate_job_command(epochs: int = None, batch_size: int = None, resume: boo
         f"  --env DATA_DIR={data_dir} \\\n"
         f"  --env CHECKPOINT_DIR={checkpoint_dir} \\\n"
         f"  --env LOG_DIR={log_dir} \\\n"
+        f"{mlflow_envs_str}"
         f"  --command \"{container_cmd}\""
     )
 

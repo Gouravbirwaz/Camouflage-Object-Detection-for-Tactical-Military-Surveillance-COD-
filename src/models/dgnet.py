@@ -386,35 +386,54 @@ class DGNet(models.Model):
 
 class DGNetLoss(losses.Loss):
     """
-    Multi-Task Supervision Loss Function for DGNet in TensorFlow:
-    Loss_total = Loss_segmentation + lambda_grad * Loss_gradient
+    Official DGNet Multi-Task Supervision Loss Function (TensorFlow 2.x):
+    Loss_total = structure_loss(mask_pred, mask_gt) + lambda_grad * MSE(grad_pred, grad_gt)
 
-    Includes label smoothing to improve generalization.
+    Implementation matches the official DGNet paper (MIR 2023 / F3Net AAAI 2020):
+    1. Adaptive boundary & foreground weight map:
+       weit = 1.0 + 5.0 * |AvgPool2D(mask, 31x31) - mask|
+       (Assigns 6x higher weight to object edges and camouflaged bodies, preventing all-black collapse)
+    2. Weighted Binary Cross-Entropy (WBCE)
+    3. Weighted IoU Loss (WIOU)
+    4. Mean Squared Error (MSE) on gradient edge map
     """
 
-    def __init__(self, lambda_grad_loss: float = 1.5, label_smoothing: float = 0.05, name: str = "dgnet_loss", **kwargs):
+    def __init__(self, lambda_grad_loss: float = 1.0, name: str = "dgnet_loss", **kwargs):
         super().__init__(name=name, **kwargs)
         self.lambda_grad_loss = lambda_grad_loss
-        self.label_smoothing = label_smoothing
-        self.bce = losses.BinaryCrossentropy(from_logits=True, label_smoothing=label_smoothing, reduction=tf.keras.losses.Reduction.SUM_OVER_BATCH_SIZE)
-        self.mae = losses.MeanAbsoluteError(reduction=tf.keras.losses.Reduction.SUM_OVER_BATCH_SIZE)
 
-    def _weighted_bce_iou_loss(self, y_true: tf.Tensor, y_pred_logits: tf.Tensor) -> tf.Tensor:
-        bce_loss = self.bce(y_true, y_pred_logits)
+    def structure_loss(self, y_true: tf.Tensor, y_pred_logits: tf.Tensor) -> tf.Tensor:
+        """
+        Structure loss from official DGNet (F3Net AAAI 2020):
+        Computes spatial adaptive weight map, weighted BCE, and weighted IoU.
+        """
+        y_true_f = tf.cast(y_true, tf.float32)
+
+        # 1. Adaptive spatial weight map (kernel 31x31, stride 1, padding same)
+        # Objects & boundaries get weight up to 6.0; flat background stays at 1.0
+        avg_pool = tf.nn.avg_pool2d(y_true_f, ksize=[1, 31, 31, 1], strides=[1, 1, 1, 1], padding="SAME")
+        weit = 1.0 + 5.0 * tf.abs(avg_pool - y_true_f)
+
+        # 2. Weighted BCE loss with logits
+        bce_raw = tf.nn.sigmoid_cross_entropy_with_logits(labels=y_true_f, logits=y_pred_logits)
+        wbce = tf.reduce_sum(weit * bce_raw, axis=[1, 2, 3]) / (tf.reduce_sum(weit, axis=[1, 2, 3]) + 1e-8)
+
+        # 3. Weighted IoU loss
         pred_sig = tf.nn.sigmoid(y_pred_logits)
+        inter = tf.reduce_sum((pred_sig * y_true_f) * weit, axis=[1, 2, 3])
+        union = tf.reduce_sum((pred_sig + y_true_f) * weit, axis=[1, 2, 3])
+        wiou = 1.0 - (inter + 1.0) / (union - inter + 1.0)
 
-        intersection = tf.reduce_sum(pred_sig * y_true, axis=[1, 2, 3])
-        union = tf.reduce_sum(pred_sig + y_true, axis=[1, 2, 3]) - intersection
-        iou_loss = 1.0 - (intersection + 1.0) / (union + 1.0)
-        return bce_loss + tf.reduce_mean(iou_loss)
+        return tf.reduce_mean(wbce + wiou)
 
     def call(self, y_true: tf.Tensor, y_pred_dict: Dict[str, tf.Tensor]) -> tf.Tensor:
         mask_logits = y_pred_dict["mask_pred"]
         grad_logits = y_pred_dict["grad_pred"]
         gt_grad = y_pred_dict["gt_grad"]
 
-        seg_loss = self._weighted_bce_iou_loss(y_true, mask_logits)
-        grad_loss = self.mae(gt_grad, tf.nn.sigmoid(grad_logits))
+        seg_loss = self.structure_loss(y_true, mask_logits)
+        grad_pred_sig = tf.nn.sigmoid(grad_logits)
+        grad_loss = tf.reduce_mean(tf.square(gt_grad - grad_pred_sig))
 
         total_loss = seg_loss + self.lambda_grad_loss * grad_loss
         return total_loss
