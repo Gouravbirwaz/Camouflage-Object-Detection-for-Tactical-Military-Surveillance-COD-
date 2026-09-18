@@ -97,6 +97,8 @@ def main():
         "metrics/*",
         "mlruns/*",
         "mlartifacts/*",
+        "scratch/*",
+        "tests/unit/output/*",
         "__pycache__/*",
         "*.pyc",
         "*.pdf",

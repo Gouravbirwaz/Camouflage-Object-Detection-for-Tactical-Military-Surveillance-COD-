@@ -1,6 +1,6 @@
-model_version: "v1.0"
-epochs: 10
-learning_rate: 0.001
+model_version: "v2.0_official_dgnet"
+epochs: 50
+learning_rate: 0.0001
 optimizer: "adam"
 checkpoint_dir: "models/raw_checkpoints"
 log_dir: "metrics"

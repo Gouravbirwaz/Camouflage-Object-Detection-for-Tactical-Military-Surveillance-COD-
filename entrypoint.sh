@@ -72,6 +72,7 @@ python3 scripts/DGnet.py \
     --data-dir ${DATA_DIR:-data/raw/dataset-splitM} \
     --checkpoint-dir "$CKPT_DIR_RESOLVED" \
     --log-dir "$LOG_DIR_RESOLVED" \
+    --version "${MODEL_VERSION:-v2.0_official_dgnet}" \
     --export-tflite \
     $RESUME_FLAG
 

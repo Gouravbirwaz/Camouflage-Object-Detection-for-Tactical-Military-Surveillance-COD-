@@ -12,9 +12,9 @@ dataset:
   test_split: 0.1
 
 model:
-  architecture: "DGNet-S"
-  version: "v1.0"
-  context_backbone: "efficientnet-b0" # Options: resnet50, efficientnet-b0
+  architecture: "DGNet"
+  version: "v2.0_official_dgnet"
+  context_backbone: "mobilenet_v3_large"
   gradient_kernel: "sobel"            # Options: sobel, scharr, laplacian
   num_classes: 1
   pretrained: true

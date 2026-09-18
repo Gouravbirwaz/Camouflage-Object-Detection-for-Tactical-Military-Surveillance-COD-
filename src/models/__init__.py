@@ -1,22 +1,36 @@
 """
 Source Models Package for COD Framework (TensorFlow 2.x)
-Exposes DGNet architecture, loss functions, and gradient extraction tools.
+Exposes official DGNet architecture, loss functions, and component modules.
 """
 
 from .dgnet import (
     DGNet,
     DGNetLoss,
-    TFGradientExtractor,
-    ContextBranch,
-    TextureBranch,
-    PartialDecoder,
+    ConvBR,
+    DimensionalReduction,
+    SoftGroupingStrategy,
+    GradientInducedTransition,
+    NeighborConnectionDecoder,
+    TextureEncoder,
+    ContextEncoder,
     build_dgnet_model,
 )
+
+# Aliases for backward compatibility
+ContextBranch = ContextEncoder
+TextureBranch = TextureEncoder
+PartialDecoder = NeighborConnectionDecoder
 
 __all__ = [
     "DGNet",
     "DGNetLoss",
-    "TFGradientExtractor",
+    "ConvBR",
+    "DimensionalReduction",
+    "SoftGroupingStrategy",
+    "GradientInducedTransition",
+    "NeighborConnectionDecoder",
+    "TextureEncoder",
+    "ContextEncoder",
     "ContextBranch",
     "TextureBranch",
     "PartialDecoder",

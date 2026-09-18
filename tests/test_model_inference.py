@@ -44,7 +44,9 @@ def load_and_preprocess_image(image_path: str, image_size: tuple = (384, 384)) -
     original_np = original.numpy()
 
     resized = tf.image.resize(original, image_size)
-    normalized = tf.cast(resized, tf.float32) / 255.0
+    imagenet_mean = tf.constant([0.485, 0.456, 0.406], dtype=tf.float32)
+    imagenet_std = tf.constant([0.229, 0.224, 0.225], dtype=tf.float32)
+    normalized = (tf.cast(resized, tf.float32) / 255.0 - imagenet_mean) / imagenet_std
     input_tensor = tf.expand_dims(normalized, axis=0)  # [1, H, W, 3]
 
     return input_tensor, original_np
@@ -236,8 +238,13 @@ def main():
     _ = model(dummy, training=False)
 
     print(f"[2/4] Loading checkpoint: {Path(checkpoint_path).name}...", flush=True)
-    model.load_weights(checkpoint_path)
-    print("       Checkpoint loaded successfully!", flush=True)
+    try:
+        model.load_weights(checkpoint_path)
+        print("       Checkpoint loaded successfully!", flush=True)
+    except Exception as e:
+        print(f"       Notice: Could not directly load all weights ({e}).")
+        print("       Ensure the model has been trained with the updated official DGNet architecture:")
+        print("       python scripts/DGnet.py --train --epochs 50 --batch-size 8")
 
     # ===== Load & Preprocess Image =====
     print(f"[3/4] Loading image: {Path(image_path).name}...", flush=True)

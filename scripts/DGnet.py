@@ -27,6 +27,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import cv2
 import numpy as np
 import tensorflow as tf
 import yaml
@@ -43,7 +44,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.models.dgnet import DGNet, DGNetLoss, build_dgnet_model, TFGradientExtractor
+from src.models.dgnet import DGNet, DGNetLoss, build_dgnet_model
 from src.utils.config import load_project_config
 from src.utils.metrics import CODMetricsAccumulator
 from src.tracking.mlflow_utils import MLflowTracker
@@ -272,37 +273,47 @@ def discover_dataset_pairs(data_dir: Path) -> Dict[str, Tuple[List[str], List[st
     return {}
 
 
-SOBEL_KX = tf.constant([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]], dtype=tf.float32)[:, :, np.newaxis, np.newaxis]
-SOBEL_KY = tf.constant([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]], dtype=tf.float32)[:, :, np.newaxis, np.newaxis]
+IMAGENET_MEAN = tf.constant([0.485, 0.456, 0.406], dtype=tf.float32)
+IMAGENET_STD = tf.constant([0.229, 0.224, 0.225], dtype=tf.float32)
 
 
-def compute_sobel_gradient_tf(mask: tf.Tensor) -> tf.Tensor:
-    """Computes ground-truth Sobel edge magnitude map from a binary mask tensor."""
-    is_3d = (len(mask.shape) == 3 or tf.rank(mask) == 3)
-    mask_4d = tf.expand_dims(mask, 0) if is_3d else mask
-
-    gx = tf.nn.conv2d(mask_4d, SOBEL_KX, strides=[1, 1, 1, 1], padding="SAME")
-    gy = tf.nn.conv2d(mask_4d, SOBEL_KY, strides=[1, 1, 1, 1], padding="SAME")
-    magnitude = tf.sqrt(tf.square(gx) + tf.square(gy) + 1e-8)
-    grad_map = tf.cast(magnitude > 0.1, tf.float32)
-
-    return tf.squeeze(grad_map, 0) if is_3d else grad_map
+def compute_object_gradient_np(image_uint8: np.ndarray, mask_uint8: np.ndarray) -> np.ndarray:
+    """
+    Computes official DGNet object-level gradient supervision map (MIR 2023 / dataset/Img2ObjGrad.py):
+    grad = cv2.Canny(image, 64, 128) * (mask >= 128)
+    Captures fine boundary and internal structural cues of the camouflaged object.
+    """
+    if image_uint8.ndim == 4:
+        image_uint8 = image_uint8[0]
+    if mask_uint8.ndim == 3 and mask_uint8.shape[-1] == 1:
+        mask_uint8 = mask_uint8[:, :, 0]
+    canny = cv2.Canny(image_uint8, 64, 128)
+    fore = ((canny > 0) & (mask_uint8 >= 128)).astype(np.float32)
+    return fore[:, :, np.newaxis]
 
 
 def parse_sample(img_path: tf.Tensor, mask_path: tf.Tensor, image_size: Tuple[int, int]) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
-    """Reads, decodes, resizes, normalizes, and extracts Sobel edge map for an image-mask pair."""
+    """Reads, decodes, resizes, normalizes (ImageNet stats), and extracts official Canny object gradient."""
     img_bytes = tf.io.read_file(img_path)
-    image = tf.image.decode_image(img_bytes, channels=3, expand_animations=False)
-    image = tf.image.resize(image, image_size)
-    image = tf.cast(image, tf.float32) / 255.0
+    image_raw = tf.image.decode_image(img_bytes, channels=3, expand_animations=False)
+    image = tf.image.resize(image_raw, image_size)
+    image_uint8 = tf.cast(image, tf.uint8)
 
     mask_bytes = tf.io.read_file(mask_path)
     mask = tf.image.decode_image(mask_bytes, channels=1, expand_animations=False)
     mask = tf.image.resize(mask, image_size, method="nearest")
-    mask = tf.cast(mask >= 128, tf.float32)
+    mask_bin = tf.cast(mask >= 128, tf.float32)
 
-    grad_gt = compute_sobel_gradient_tf(mask)
-    return image, mask, grad_gt
+    def _py_grad(im, m):
+        return compute_object_gradient_np(im, m)
+
+    grad_gt = tf.numpy_function(_py_grad, [image_uint8, tf.cast(mask, tf.uint8)], tf.float32)
+    grad_gt.set_shape([image_size[0], image_size[1], 1])
+
+    # Standard ImageNet normalization matching official DGNet
+    image_norm = (tf.cast(image, tf.float32) / 255.0 - IMAGENET_MEAN) / IMAGENET_STD
+
+    return image_norm, mask_bin, grad_gt
 
 
 def create_tf_dataset(

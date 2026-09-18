@@ -1,16 +1,20 @@
 """
-DGNet: Deep Gradient Network for Realtime Camouflaged Object Detection (COD)
+Official DGNet: Deep Gradient Network for Realtime Camouflaged Object Detection (COD)
 Pure TensorFlow 2.x / Keras Implementation
-Tactical Military Surveillance Framework
+Direct translation of official reference: https://github.com/GewelsJI/DGNet (MIR 2023)
 
 Architecture Overview:
-1. Context Branch ("The Searcher"): Multi-scale feature extractor using Keras MobileNet (MobileNetV3/MobileNetV2),
-   EfficientNet, or ResNet backbones.
-2. Texture Branch ("The Identifier" / GIT): Gradient-Induced Transition module operating on image
-   gradient magnitude maps (Sobel/Scharr/Laplacian) to discover subtle structural anomalies.
-3. Partial Decoder Component (PDC): Aggregates multi-scale context and texture features via
-   neighbor connections to output camouflage mask predictions and predicted gradient maps.
-4. DGNetLoss: Multi-task supervision combining BCE + IoU segmentation loss and MAE gradient loss.
+1. Context Encoder: Multi-scale feature extractor (MobileNetV3Large, EfficientNetB1/B4, ResNet50)
+   extracting features at strides 8, 16, 32 (x3, x4, x5).
+2. Dimensional Reduction: 2-layer ConvBR per scale reducing x3, x4, x5 to fixed channel width (xr3, xr4, xr5).
+3. Texture Encoder: 3-stage convolutional encoder taking raw RGB image x, producing
+   gradient features xg (stride 8, 32 channels) and predicted gradient pg (stride 8, 1 channel).
+4. Gradient-Induced Transition (GIT): Feature interleaving + Soft Grouping Strategy (SGS)
+   with grouped 1x1 convolutions (N=[4, 8, 16]) and attention residual learning (zt3, zt4, zt5).
+5. Neighbor Connection Decoder (NCD): Cross-scale neighbor fusion with multiplicative and
+   concatenation interactions generating high-resolution, boundary-preserving camouflage masks.
+6. Multi-Task Structure Loss: Weighted BCE + Weighted IoU with 31x31 adaptive edge weighting (weit)
+   plus auxiliary MSE loss on object gradient maps.
 """
 
 import os
@@ -18,367 +22,359 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras import layers, models, losses, initializers
+from tensorflow.keras import layers, models, losses
 
 
-class TFGradientExtractor(layers.Layer):
+class ConvBR(layers.Layer):
     """
-    Differentiable TensorFlow layer for extracting image gradient magnitude maps
-    using standard gradient kernels (Sobel, Scharr, or Laplacian).
+    Standard Convolution + Batch Normalization + ReLU block with He Normal initialization.
+    Equivalent to PyTorch ConvBR in official DGNet.
     """
 
-    def __init__(self, kernel_type: str = "sobel", **kwargs):
-        super().__init__(**kwargs)
-        self.kernel_type = kernel_type.lower()
+    def __init__(
+        self,
+        out_channel: int,
+        kernel_size: int = 3,
+        stride: int = 1,
+        padding: str = "same",
+        dilation_rate: int = 1,
+        name: Optional[str] = None,
+        **kwargs
+    ):
+        super().__init__(name=name, **kwargs)
+        self.out_channel = out_channel
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation_rate = dilation_rate
 
-        if self.kernel_type == "sobel":
-            kx = np.array([[-1.0, 0.0, 1.0],
-                           [-2.0, 0.0, 2.0],
-                           [-1.0, 0.0, 1.0]], dtype=np.float32)
-            ky = np.array([[-1.0, -2.0, -1.0],
-                           [ 0.0,  0.0,  0.0],
-                           [ 1.0,  2.0,  1.0]], dtype=np.float32)
-        elif self.kernel_type == "scharr":
-            kx = np.array([[-3.0, 0.0, 3.0],
-                           [-10.0, 0.0, 10.0],
-                           [-3.0, 0.0, 3.0]], dtype=np.float32) / 16.0
-            ky = np.array([[-3.0, -10.0, -3.0],
-                           [ 0.0,   0.0,  0.0],
-                           [ 3.0,  10.0,  3.0]], dtype=np.float32) / 16.0
-        elif self.kernel_type == "laplacian":
-            kl = np.array([[0.0,  1.0, 0.0],
-                           [1.0, -4.0, 1.0],
-                           [0.0,  1.0, 0.0]], dtype=np.float32)
-            self.kl = tf.constant(kl[:, :, np.newaxis, np.newaxis], dtype=tf.float32)
-        else:
-            raise ValueError(f"Unsupported gradient kernel_type: {kernel_type}. Choose 'sobel', 'scharr', or 'laplacian'.")
+        self.conv = layers.Conv2D(
+            filters=out_channel,
+            kernel_size=kernel_size,
+            strides=stride,
+            padding=padding,
+            dilation_rate=dilation_rate,
+            use_bias=False,
+            kernel_initializer="he_normal",
+            name=f"{name}_conv" if name else None
+        )
+        self.bn = layers.BatchNormalization(name=f"{name}_bn" if name else None)
+        self.relu = layers.ReLU(name=f"{name}_relu" if name else None)
 
-        if self.kernel_type in ["sobel", "scharr"]:
-            self.kx = tf.constant(kx[:, :, np.newaxis, np.newaxis], dtype=tf.float32)
-            self.ky = tf.constant(ky[:, :, np.newaxis, np.newaxis], dtype=tf.float32)
+    def call(self, x: tf.Tensor, training: Optional[bool] = None) -> tf.Tensor:
+        x = self.conv(x)
+        x = self.bn(x, training=training)
+        x = self.relu(x)
+        return x
 
-    def call(self, inputs: tf.Tensor) -> tf.Tensor:
+
+class DimensionalReduction(layers.Layer):
+    """
+    Dimensional Reduction module in official DGNet:
+    Passes extracted backbone features through two consecutive 3x3 ConvBR blocks.
+    """
+
+    def __init__(self, out_channel: int, name: Optional[str] = None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.reduce1 = ConvBR(out_channel, kernel_size=3, padding="same", name=f"{name}_br1" if name else None)
+        self.reduce2 = ConvBR(out_channel, kernel_size=3, padding="same", name=f"{name}_br2" if name else None)
+
+    def call(self, x: tf.Tensor, training: Optional[bool] = None) -> tf.Tensor:
+        x = self.reduce1(x, training=training)
+        x = self.reduce2(x, training=training)
+        return x
+
+
+class SoftGroupingStrategy(layers.Layer):
+    """
+    Soft Grouping Strategy (SGS) from official DGNet:
+    Applies 3 parallel 1x1 grouped convolutions with group sizes N=[4, 8, 16] and sums their outputs.
+    """
+
+    def __init__(self, in_channel: int, out_channel: int, N: List[int] = [4, 8, 16], name: Optional[str] = None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.g_conv1 = layers.Conv2D(out_channel, kernel_size=1, groups=N[0], use_bias=False, kernel_initializer="he_normal")
+        self.g_conv2 = layers.Conv2D(out_channel, kernel_size=1, groups=N[1], use_bias=False, kernel_initializer="he_normal")
+        self.g_conv3 = layers.Conv2D(out_channel, kernel_size=1, groups=N[2], use_bias=False, kernel_initializer="he_normal")
+
+    def call(self, q: tf.Tensor) -> tf.Tensor:
+        return self.g_conv1(q) + self.g_conv2(q) + self.g_conv3(q)
+
+
+class GradientInducedTransition(layers.Layer):
+    """
+    Gradient-Induced Transition (GIT) module from official DGNet:
+    Transmits gradient cues from the Texture Encoder into multi-scale context features.
+    Uses grouped feature interleaving followed by Soft Grouping Strategy (SGS) and residual addition.
+    """
+
+    def __init__(
+        self,
+        channel: int = 64,
+        M: List[int] = [8, 8, 8],
+        N: List[int] = [4, 8, 16],
+        name: Optional[str] = None,
+        **kwargs
+    ):
+        super().__init__(name=name, **kwargs)
+        self.channel = channel
+        self.M = M
+        self.N = N
+
+        self.sgs3 = SoftGroupingStrategy(in_channel=channel + 32, out_channel=channel, N=N, name=f"{name}_sgs3" if name else None)
+        self.sgs4 = SoftGroupingStrategy(in_channel=channel + 32, out_channel=channel, N=N, name=f"{name}_sgs4" if name else None)
+        self.sgs5 = SoftGroupingStrategy(in_channel=channel + 32, out_channel=channel, N=N, name=f"{name}_sgs5" if name else None)
+
+    def _gradient_induced_feature_grouping(self, xr: tf.Tensor, xg: tf.Tensor, M: int) -> tf.Tensor:
         """
-        Input: inputs of shape [B, H, W, 3] or [B, H, W, 1]
-        Output: Gradient magnitude map of shape [B, H, W, 1] normalized in range [0, 1]
+        Interleaves feature channels between context features (xr) and gradient features (xg).
+        Splits both into M channel chunks and interleaves them along the channel axis.
         """
-        if inputs.shape[-1] == 3:
-            # Convert RGB to Grayscale: 0.299 R + 0.587 G + 0.114 B
-            gray = 0.299 * inputs[..., 0:1] + 0.587 * inputs[..., 1:2] + 0.114 * inputs[..., 2:3]
-        else:
-            gray = inputs
+        if M not in [1, 2, 4, 8, 16, 32]:
+            raise ValueError(f"Invalid Group Number M: {M}. Must be one of [1, 2, 4, 8, 16, 32].")
 
-        if self.kernel_type in ["sobel", "scharr"]:
-            gx = tf.nn.conv2d(gray, self.kx, strides=[1, 1, 1, 1], padding="SAME")
-            gy = tf.nn.conv2d(gray, self.ky, strides=[1, 1, 1, 1], padding="SAME")
-            magnitude = tf.sqrt(tf.square(gx) + tf.square(gy) + 1e-8)
-        else:  # laplacian
-            magnitude = tf.abs(tf.nn.conv2d(gray, self.kl, strides=[1, 1, 1, 1], padding="SAME"))
+        if M == 1:
+            return tf.concat([xr, xg], axis=-1)
 
-        # Batch-wise normalization to [0, 1]
-        max_val = tf.reduce_max(magnitude, axis=[1, 2, 3], keepdims=True) + 1e-8
-        magnitude = magnitude / max_val
-        return magnitude
+        xr_g = tf.split(xr, num_or_size_splits=M, axis=-1)
+        xg_g = tf.split(xg, num_or_size_splits=M, axis=-1)
+        interleaved = []
+        for i in range(M):
+            interleaved.extend([xr_g[i], xg_g[i]])
+
+        return tf.concat(interleaved, axis=-1)
+
+    def call(self, xr3: tf.Tensor, xr4: tf.Tensor, xr5: tf.Tensor, xg: tf.Tensor, training: Optional[bool] = None) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+        # Spatial dimensions of context features
+        h4, w4 = tf.shape(xr4)[1], tf.shape(xr4)[2]
+        h5, w5 = tf.shape(xr5)[1], tf.shape(xr5)[2]
+
+        # Downsample gradient feature xg to match xr4 (H/16) and xr5 (H/32)
+        xg_down2 = tf.image.resize(xg, (h4, w4), method="bilinear")
+        xg_down4 = tf.image.resize(xg, (h5, w5), method="bilinear")
+
+        # Transmit gradient cues into context embeddings
+        q3 = self._gradient_induced_feature_grouping(xr3, xg, M=self.M[0])
+        q4 = self._gradient_induced_feature_grouping(xr4, xg_down2, M=self.M[1])
+        q5 = self._gradient_induced_feature_grouping(xr5, xg_down4, M=self.M[2])
+
+        # Attention residual learning
+        zt3 = xr3 + self.sgs3(q3)
+        zt4 = xr4 + self.sgs4(q4)
+        zt5 = xr5 + self.sgs5(q5)
+
+        return zt3, zt4, zt5
 
 
-class ChannelSpatialAttention(layers.Layer):
+class NeighborConnectionDecoder(layers.Layer):
     """
-    Lightweight Spatial and Channel Attention Module (CBAM-style) in Keras
-    to focus on subtle camouflaged boundaries.
+    Neighbor Connection Decoder (NCD) from official DGNet:
+    Fuses multi-scale features hierarchically from coarse to fine (zt5 -> zt4 -> zt3)
+    using multiplicative neighbor connections and cross-scale concatenation.
+    Produces high-resolution, boundary-faithful camouflage predictions.
     """
 
-    def __init__(self, channels: int, reduction: int = 16, **kwargs):
-        super().__init__(**kwargs)
-        reduced_ch = max(channels // reduction, 8)
-        self.fc1 = layers.Dense(reduced_ch, activation="relu", use_bias=False)
-        self.fc2 = layers.Dense(channels, use_bias=False)
-        self.spatial_conv = layers.Conv2D(1, kernel_size=7, padding="same", activation="sigmoid", use_bias=False)
+    def __init__(self, channel: int = 64, name: Optional[str] = None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.channel = channel
 
-    def call(self, inputs: tf.Tensor) -> tf.Tensor:
-        # Channel Attention
-        avg_pool = tf.reduce_mean(inputs, axis=[1, 2], keepdims=True)
-        max_pool = tf.reduce_max(inputs, axis=[1, 2], keepdims=True)
+        self.conv_upsample1 = ConvBR(channel, kernel_size=3, padding="same", name=f"{name}_u1" if name else None)
+        self.conv_upsample2 = ConvBR(channel, kernel_size=3, padding="same", name=f"{name}_u2" if name else None)
+        self.conv_upsample3 = ConvBR(channel, kernel_size=3, padding="same", name=f"{name}_u3" if name else None)
+        self.conv_upsample4 = ConvBR(channel, kernel_size=3, padding="same", name=f"{name}_u4" if name else None)
+        self.conv_upsample5 = ConvBR(2 * channel, kernel_size=3, padding="same", name=f"{name}_u5" if name else None)
 
-        ca = self.fc2(self.fc1(avg_pool)) + self.fc2(self.fc1(max_pool))
-        ca_weight = tf.nn.sigmoid(ca)
-        x_ca = inputs * ca_weight
+        self.conv_concat2 = ConvBR(2 * channel, kernel_size=3, padding="same", name=f"{name}_c2" if name else None)
+        self.conv_concat3 = ConvBR(3 * channel, kernel_size=3, padding="same", name=f"{name}_c3" if name else None)
+        self.conv4 = ConvBR(3 * channel, kernel_size=3, padding="same", name=f"{name}_c4" if name else None)
+        self.conv5 = layers.Conv2D(1, kernel_size=1, use_bias=True, kernel_initializer="he_normal", name=f"{name}_c5" if name else None)
 
-        # Spatial Attention
-        avg_spatial = tf.reduce_mean(x_ca, axis=-1, keepdims=True)
-        max_spatial = tf.reduce_max(x_ca, axis=-1, keepdims=True)
-        spatial_cat = tf.concat([avg_spatial, max_spatial], axis=-1)
-        sa_weight = self.spatial_conv(spatial_cat)
+    def _resize_to(self, x: tf.Tensor, target: tf.Tensor) -> tf.Tensor:
+        h, w = tf.shape(target)[1], tf.shape(target)[2]
+        return tf.image.resize(x, (h, w), method="bilinear")
 
-        return x_ca * sa_weight
+    def call(self, zt5: tf.Tensor, zt4: tf.Tensor, zt3: tf.Tensor, training: Optional[bool] = None) -> tf.Tensor:
+        zt5_1 = zt5
+        zt4_1 = self.conv_upsample1(self._resize_to(zt5, zt4), training=training) * zt4
+        zt3_1 = (
+            self.conv_upsample2(self._resize_to(zt4_1, zt3), training=training) *
+            self.conv_upsample3(self._resize_to(zt4, zt3), training=training) *
+            zt3
+        )
+
+        zt4_2 = tf.concat([zt4_1, self.conv_upsample4(self._resize_to(zt5_1, zt4), training=training)], axis=-1)
+        zt4_2 = self.conv_concat2(zt4_2, training=training)
+
+        zt3_2 = tf.concat([zt3_1, self.conv_upsample5(self._resize_to(zt4_2, zt3), training=training)], axis=-1)
+        zt3_2 = self.conv_concat3(zt3_2, training=training)
+
+        pc = self.conv4(zt3_2, training=training)
+        pc = self.conv5(pc)
+        return pc
 
 
-class ContextBranch(layers.Layer):
+class TextureEncoder(layers.Layer):
     """
-    Context Branch ("The Searcher"):
-    Uses MobileNet (MobileNetV3 / MobileNetV2), EfficientNet, or ResNet as backbone
-    to extract multi-scale semantic context features across 4 stages (strides 4, 8, 16, 32).
+    Texture Encoder from official DGNet:
+    Processes the raw 3-channel RGB image through 3 strided convolutional stages (total stride 8).
+    Outputs:
+      xg: Texture gradient feature map at stride 8 with 32 channels.
+      pg: Gradient prediction map at stride 8 with 1 channel.
+    """
+
+    def __init__(self, name: Optional[str] = None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.conv1 = ConvBR(64, kernel_size=7, stride=2, padding="same", name=f"{name}_c1" if name else None)
+        self.conv2 = ConvBR(64, kernel_size=3, stride=2, padding="same", name=f"{name}_c2" if name else None)
+        self.conv3 = ConvBR(32, kernel_size=3, stride=2, padding="same", name=f"{name}_c3" if name else None)
+        self.conv_out = ConvBR(1, kernel_size=1, stride=1, padding="same", name=f"{name}_out" if name else None)
+
+    def call(self, x: tf.Tensor, training: Optional[bool] = None) -> Tuple[tf.Tensor, tf.Tensor]:
+        feat = self.conv1(x, training=training)
+        feat = self.conv2(feat, training=training)
+        xg = self.conv3(feat, training=training)
+        pg = self.conv_out(xg, training=training)
+        return xg, pg
+
+
+class ContextEncoder(layers.Layer):
+    """
+    Context Encoder: Multi-scale semantic feature extractor across strides 8, 16, 32.
+    Supports MobileNetV3Large, EfficientNetB1 (official DGNet-S), and EfficientNetB4 (official DGNet).
     """
 
     def __init__(
         self,
         backbone_name: str = "mobilenet_v3_large",
         input_shape: Tuple[int, int, int] = (384, 384, 3),
-        feature_channels: int = 64,
         pretrained: bool = True,
+        name: Optional[str] = None,
         **kwargs
     ):
-        super().__init__(**kwargs)
-        self.backbone_name = backbone_name.lower()
-        self.feature_channels = feature_channels
+        super().__init__(name=name, **kwargs)
+        self.backbone_name = backbone_name.lower().replace("-", "_")
         weights = "imagenet" if pretrained else None
 
-        if "mobilenet_v3_large" in self.backbone_name:
-            base_model = tf.keras.applications.MobileNetV3Large(
-                include_top=False, weights=weights, input_shape=input_shape
-            )
-            # Extracted layers corresponding to strides 4, 8, 16, 32
-            stage_names = [
-                "expanded_conv/Add",             # Stride 4 (40 ch)
-                "expanded_conv_3/Add",           # Stride 8 (40 ch)
-                "expanded_conv_11/Add",          # Stride 16 (112 ch)
-                "conv_1"                         # Stride 32 (960 ch)
+        if "efficientnet_b1" in self.backbone_name:
+            base = tf.keras.applications.EfficientNetB1(include_top=False, weights=weights, input_shape=input_shape)
+            x3_name, x4_name, x5_name = "block3c_add", "block5d_add", "block7b_add"
+            self.in_channels = [40, 112, 320]
+        elif "efficientnet_b4" in self.backbone_name:
+            base = tf.keras.applications.EfficientNetB4(include_top=False, weights=weights, input_shape=input_shape)
+            x3_name, x4_name, x5_name = "block3d_add", "block5f_add", "block7b_add"
+            self.in_channels = [56, 160, 448]
+        else:  # mobilenet_v3_large default
+            base = tf.keras.applications.MobileNetV3Large(include_top=False, weights=weights, input_shape=input_shape)
+            layer_map = {l.name: l for l in base.layers}
+            x3_candidates = ["expanded_conv_5_add", "expanded_conv_3_project_bn", "expanded_conv_3/Add", "expanded_conv_3_add"]
+            x4_candidates = ["expanded_conv_11_add", "expanded_conv_11/Add", "expanded_conv_11_project_bn"]
+            x5_candidates = ["conv_1", "conv_1_bn", "conv_1/Add"]
+
+            def _find_layer(candidates):
+                for c in candidates:
+                    if c in layer_map:
+                        return c
+                raise ValueError(f"Could not find valid layer among {candidates} in MobileNetV3Large.")
+
+            x3_name = _find_layer(x3_candidates)
+            x4_name = _find_layer(x4_candidates)
+            x5_name = _find_layer(x5_candidates)
+            self.in_channels = [
+                base.get_layer(x3_name).output.shape[-1],
+                base.get_layer(x4_name).output.shape[-1],
+                base.get_layer(x5_name).output.shape[-1]
             ]
-        elif "mobilenet_v3_small" in self.backbone_name:
-            base_model = tf.keras.applications.MobileNetV3Small(
-                include_top=False, weights=weights, input_shape=input_shape
-            )
-            stage_names = [
-                "expanded_conv/project/BatchNorm", # Stride 4 (16 ch)
-                "expanded_conv_1/Add",            # Stride 8 (24 ch)
-                "expanded_conv_7/Add",            # Stride 16 (48 ch)
-                "conv_1"                          # Stride 32 (576 ch)
-            ]
-        elif "mobilenet_v2" in self.backbone_name:
-            base_model = tf.keras.applications.MobileNetV2(
-                include_top=False, weights=weights, input_shape=input_shape
-            )
-            stage_names = [
-                "block_2_add",   # Stride 4 (24 ch)
-                "block_5_add",   # Stride 8 (32 ch)
-                "block_12_add",  # Stride 16 (96 ch)
-                "out_relu"       # Stride 32 (1280 ch)
-            ]
-        elif "efficientnet" in self.backbone_name:
-            base_model = tf.keras.applications.EfficientNetB0(
-                include_top=False, weights=weights, input_shape=input_shape
-            )
-            stage_names = [
-                "block2b_add",  # Stride 4
-                "block3b_add",  # Stride 8
-                "block5c_add",  # Stride 16
-                "top_activation"# Stride 32
-            ]
-        elif "resnet" in self.backbone_name:
-            base_model = tf.keras.applications.ResNet50(
-                include_top=False, weights=weights, input_shape=input_shape
-            )
-            stage_names = [
-                "conv2_block3_out", # Stride 4
-                "conv3_block4_out", # Stride 8
-                "conv4_block6_out", # Stride 16
-                "conv5_block3_out"  # Stride 32
-            ]
-        else:
-            raise ValueError(f"Unsupported backbone: {backbone_name}.")
 
-        # Multi-output extractor sub-model
-        outputs = []
-        for name in stage_names:
-            try:
-                outputs.append(base_model.get_layer(name).output)
-            except ValueError:
-                # Fallback to nearest available layer with compatible stride
-                fallback_layer = [l for l in base_model.layers if l.name.startswith(name.split("/")[0])][-1]
-                outputs.append(fallback_layer.output)
+        self.extractor = models.Model(
+            inputs=base.input,
+            outputs=[
+                base.get_layer(x3_name).output,
+                base.get_layer(x4_name).output,
+                base.get_layer(x5_name).output
+            ],
+            name=f"{self.backbone_name}_multi_scale"
+        )
 
-        self.extractor = models.Model(inputs=base_model.input, outputs=outputs, name="context_extractor")
-
-        # 1x1 Adapters to project all multi-scale feature maps to standardized channel dimensions
-        self.adapter1 = models.Sequential([layers.Conv2D(feature_channels, 1, use_bias=False), layers.BatchNormalization(), layers.ReLU()])
-        self.adapter2 = models.Sequential([layers.Conv2D(feature_channels, 1, use_bias=False), layers.BatchNormalization(), layers.ReLU()])
-        self.adapter3 = models.Sequential([layers.Conv2D(feature_channels, 1, use_bias=False), layers.BatchNormalization(), layers.ReLU()])
-        self.adapter4 = models.Sequential([layers.Conv2D(feature_channels, 1, use_bias=False), layers.BatchNormalization(), layers.ReLU()])
-
-    def call(self, inputs: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
-        feats = self.extractor(inputs)
-        c1 = self.adapter1(feats[0])
-        c2 = self.adapter2(feats[1])
-        c3 = self.adapter3(feats[2])
-        c4 = self.adapter4(feats[3])
-        return c1, c2, c3, c4
-
-
-class TextureBranch(layers.Layer):
-    """
-    Texture Branch ("The Identifier" / GIT):
-    Processes image gradient magnitude maps and shallow context features
-    to highlight high-frequency structural boundaries and intensity transitions.
-    """
-
-    def __init__(self, in_channels: int = 64, out_channels: int = 64, **kwargs):
-        super().__init__(**kwargs)
-        self.grad_conv = models.Sequential([
-            layers.Conv2D(32, kernel_size=3, padding="same", use_bias=False),
-            layers.BatchNormalization(),
-            layers.ReLU(),
-            layers.Conv2D(out_channels, kernel_size=3, padding="same", use_bias=False),
-            layers.BatchNormalization(),
-            layers.ReLU()
-        ])
-
-        self.fusion = models.Sequential([
-            layers.Conv2D(out_channels, kernel_size=3, padding="same", use_bias=False),
-            layers.BatchNormalization(),
-            layers.ReLU(),
-            ChannelSpatialAttention(out_channels)
-        ])
-
-    def call(self, grad_map: tf.Tensor, shallow_feat: tf.Tensor) -> tf.Tensor:
-        # Resize gradient map to match shallow feature resolution (Stride 4)
-        target_shape = (tf.shape(shallow_feat)[1], tf.shape(shallow_feat)[2])
-        grad_map_down = tf.image.resize(grad_map, size=target_shape, method="bilinear")
-
-        grad_feat = self.grad_conv(grad_map_down)
-        combined = tf.concat([shallow_feat, grad_feat], axis=-1)
-        texture_feat = self.fusion(combined)
-        return texture_feat
-
-
-class NeighborConnectionBlock(layers.Layer):
-    """
-    Neighbor Connection Block (NCB):
-    Fuses high-level semantic context with lower-level spatial detail from adjacent stages.
-    """
-
-    def __init__(self, channels: int = 64, **kwargs):
-        super().__init__(**kwargs)
-        self.conv_high = models.Sequential([
-            layers.Conv2D(channels, 3, padding="same", use_bias=False),
-            layers.BatchNormalization(),
-            layers.ReLU()
-        ])
-        self.conv_low = models.Sequential([
-            layers.Conv2D(channels, 3, padding="same", use_bias=False),
-            layers.BatchNormalization(),
-            layers.ReLU()
-        ])
-        self.fusion = models.Sequential([
-            layers.Conv2D(channels, 3, padding="same", use_bias=False),
-            layers.BatchNormalization(),
-            layers.ReLU(),
-            ChannelSpatialAttention(channels)
-        ])
-
-    def call(self, high_feat: tf.Tensor, low_feat: tf.Tensor) -> tf.Tensor:
-        target_shape = (tf.shape(low_feat)[1], tf.shape(low_feat)[2])
-        high_up = tf.image.resize(high_feat, size=target_shape, method="bilinear")
-        high_proc = self.conv_high(high_up)
-        low_proc = self.conv_low(low_feat)
-        merged = tf.concat([high_proc, low_proc], axis=-1)
-        return self.fusion(merged)
-
-
-class PartialDecoder(layers.Layer):
-    """
-    Partial Decoder Component (PDC):
-    Progressively aggregates multi-scale context features (C1, C2, C3, C4)
-    and texture features (T) to predict camouflage mask and edge gradient maps.
-    Includes Dropout before prediction heads to reduce overfitting.
-    """
-
-    def __init__(self, channels: int = 64, num_classes: int = 1, dropout_rate: float = 0.3, **kwargs):
-        super().__init__(**kwargs)
-        self.ncb3 = NeighborConnectionBlock(channels)
-        self.ncb2 = NeighborConnectionBlock(channels)
-        self.ncb1 = NeighborConnectionBlock(channels)
-        self.texture_ncb = NeighborConnectionBlock(channels)
-
-        # Dropout before prediction heads to reduce overfitting
-        self.feat_dropout = layers.Dropout(dropout_rate)
-
-        # Output prediction heads
-        self.mask_head = models.Sequential([
-            layers.Conv2D(channels // 2, kernel_size=3, padding="same", use_bias=False),
-            layers.BatchNormalization(),
-            layers.ReLU(),
-            layers.Dropout(dropout_rate / 2),
-            layers.Conv2D(num_classes, kernel_size=1)
-        ])
-
-        self.grad_head = models.Sequential([
-            layers.Conv2D(channels // 2, kernel_size=3, padding="same", use_bias=False),
-            layers.BatchNormalization(),
-            layers.ReLU(),
-            layers.Dropout(dropout_rate / 2),
-            layers.Conv2D(1, kernel_size=1)
-        ])
-
-    def call(self, c1: tf.Tensor, c2: tf.Tensor, c3: tf.Tensor, c4: tf.Tensor, texture_feat: tf.Tensor, target_shape: Tuple[int, int], training: Optional[bool] = None) -> Tuple[tf.Tensor, tf.Tensor]:
-        f3 = self.ncb3(c4, c3)
-        f2 = self.ncb2(f3, c2)
-        f1 = self.ncb1(f2, c1)
-        final_feat = self.texture_ncb(f1, texture_feat)
-
-        # Apply dropout before prediction heads (active only during training)
-        final_feat = self.feat_dropout(final_feat, training=training)
-
-        mask_logits = tf.image.resize(self.mask_head(final_feat, training=training), size=target_shape, method="bilinear")
-        grad_logits = tf.image.resize(self.grad_head(final_feat, training=training), size=target_shape, method="bilinear")
-
-        return mask_logits, grad_logits
+    def call(self, x: tf.Tensor, training: Optional[bool] = None) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+        return self.extractor(x, training=training)
 
 
 class DGNet(models.Model):
     """
-    Deep Gradient Network (DGNet) for Camouflaged Object Detection in TensorFlow 2.x.
-    Optimized for Edge Deployment on NVIDIA Jetson / ARM / TFLite devices.
+    Official Deep Gradient Network (DGNet) in TensorFlow 2.x / Keras.
+    Direct implementation of the MIR 2023 paper and GewelsJI/DGNet repository.
     """
 
     def __init__(
         self,
         backbone_name: str = "mobilenet_v3_large",
         input_shape: Tuple[int, int, int] = (384, 384, 3),
-        gradient_kernel: str = "sobel",
-        num_classes: int = 1,
-        feature_channels: int = 64,
-        pretrained: bool = True,                                
+        channel: int = 64,
+        M: List[int] = [8, 8, 8],
+        N: List[int] = [4, 8, 16],
+        pretrained: bool = True,
         **kwargs
     ):
         super().__init__(**kwargs)
         self.backbone_name = backbone_name
-        self.gradient_kernel = gradient_kernel
-        self.num_classes = num_classes
+        self.channel = channel
+        self.gradient_kernel = kwargs.get("gradient_kernel", "sobel")
+        self.num_classes = kwargs.get("num_classes", 1)
 
-        self.gradient_extractor = TFGradientExtractor(kernel_type=gradient_kernel)
-        self.context_branch = ContextBranch(backbone_name=backbone_name, input_shape=input_shape, feature_channels=feature_channels, pretrained=pretrained)
-        self.texture_branch = TextureBranch(in_channels=feature_channels, out_channels=feature_channels)
-        self.decoder = PartialDecoder(channels=feature_channels, num_classes=num_classes)
+        # 1. Context Encoder
+        self.context_encoder = ContextEncoder(
+            backbone_name=backbone_name,
+            input_shape=input_shape,
+            pretrained=pretrained,
+            name="context_encoder"
+        )
 
-    def call(self, inputs: tf.Tensor, training: Optional[bool] = None, return_dict: bool = False) -> Union[tf.Tensor, Dict[str, tf.Tensor]]:
-        target_shape = (tf.shape(inputs)[1], tf.shape(inputs)[2])
+        # 2. Texture Encoder
+        self.texture_encoder = TextureEncoder(name="texture_encoder")
 
-        # 1. Image Gradient Map Extraction
-        grad_map = self.gradient_extractor(inputs)
+        # 3. Dimensional Reduction for Context Features (x3, x4, x5 -> xr3, xr4, xr5)
+        self.dr3 = DimensionalReduction(out_channel=channel, name="dr3")
+        self.dr4 = DimensionalReduction(out_channel=channel, name="dr4")
+        self.dr5 = DimensionalReduction(out_channel=channel, name="dr5")
 
-        # 2. Context Branch Multi-Scale Feature Extraction
-        c1, c2, c3, c4 = self.context_branch(inputs)
+        # 4. Gradient-Induced Transition (GIT)
+        self.git = GradientInducedTransition(channel=channel, M=M, N=N, name="git")
 
-        # 3. Texture Branch Feature Transition Extraction
-        texture_feat = self.texture_branch(grad_map, c1)
+        # 5. Neighbor Connection Decoder (NCD)
+        self.ncd = NeighborConnectionDecoder(channel=channel, name="ncd")
 
-        # 4. Partial Decoder Component Fusion
-        mask_logits, grad_logits = self.decoder(c1, c2, c3, c4, texture_feat, target_shape=target_shape, training=training)
+    def call(
+        self,
+        inputs: tf.Tensor,
+        training: Optional[bool] = None,
+        return_dict: bool = False
+    ) -> Union[tf.Tensor, Dict[str, tf.Tensor]]:
+        target_h = tf.shape(inputs)[1]
+        target_w = tf.shape(inputs)[2]
+
+        # 1. Context Path: extract multi-scale features at strides 8, 16, 32
+        x3, x4, x5 = self.context_encoder(inputs, training=training)
+        xr3 = self.dr3(x3, training=training)
+        xr4 = self.dr4(x4, training=training)
+        xr5 = self.dr5(x5, training=training)
+
+        # 2. Spatial / Texture Path: extract gradient features and edge predictions
+        xg, pg = self.texture_encoder(inputs, training=training)
+
+        # 3. Gradient-Induced Transition (GIT)
+        zt3, zt4, zt5 = self.git(xr3, xr4, xr5, xg, training=training)
+
+        # 4. Neighbor Connection Decoder (NCD)
+        pc = self.ncd(zt5, zt4, zt3, training=training)
+
+        # 5. Upsample predictions to full resolution (stride 8 -> full image)
+        mask_logits = tf.image.resize(pc, (target_h, target_w), method="bilinear")
+        grad_logits = tf.image.resize(pg, (target_h, target_w), method="bilinear")
 
         if training or return_dict:
             return {
                 "mask_pred": mask_logits,
-                "grad_pred": grad_logits,
-                "gt_grad": grad_map
+                "grad_pred": grad_logits
             }
 
         return tf.nn.sigmoid(mask_logits)
@@ -386,16 +382,15 @@ class DGNet(models.Model):
 
 class DGNetLoss(losses.Loss):
     """
-    Official DGNet Multi-Task Supervision Loss Function (TensorFlow 2.x):
-    Loss_total = structure_loss(mask_pred, mask_gt) + lambda_grad * MSE(grad_pred, grad_gt)
+    Official DGNet Multi-Task Structure Loss (F3Net AAAI 2020 / DGNet MIR 2023):
+    Total_Loss = structure_loss(mask_logits, gt_mask) + lambda_grad * MSE(grad_pred, grad_gt)
 
-    Implementation matches the official DGNet paper (MIR 2023 / F3Net AAAI 2020):
-    1. Adaptive boundary & foreground weight map:
-       weit = 1.0 + 5.0 * |AvgPool2D(mask, 31x31) - mask|
-       (Assigns 6x higher weight to object edges and camouflaged bodies, preventing all-black collapse)
-    2. Weighted Binary Cross-Entropy (WBCE)
-    3. Weighted IoU Loss (WIOU)
-    4. Mean Squared Error (MSE) on gradient edge map
+    Key properties:
+    - Adaptive boundary & foreground weight map:
+      weit = 1.0 + 5.0 * |AvgPool2D(gt_mask, 31x31) - gt_mask|
+    - Weighted Binary Cross-Entropy (WBCE)
+    - Weighted IoU Loss (WIOU)
+    - Auxiliary Mean Squared Error on object-level gradient map
     """
 
     def __init__(self, lambda_grad_loss: float = 1.0, name: str = "dgnet_loss", **kwargs):
@@ -404,21 +399,19 @@ class DGNetLoss(losses.Loss):
 
     def structure_loss(self, y_true: tf.Tensor, y_pred_logits: tf.Tensor) -> tf.Tensor:
         """
-        Structure loss from official DGNet (F3Net AAAI 2020):
-        Computes spatial adaptive weight map, weighted BCE, and weighted IoU.
+        Structure loss matching official DGNet (F3Net AAAI 2020).
         """
         y_true_f = tf.cast(y_true, tf.float32)
 
-        # 1. Adaptive spatial weight map (kernel 31x31, stride 1, padding same)
-        # Objects & boundaries get weight up to 6.0; flat background stays at 1.0
+        # Adaptive spatial weight map (kernel 31x31, stride 1, padding same)
         avg_pool = tf.nn.avg_pool2d(y_true_f, ksize=[1, 31, 31, 1], strides=[1, 1, 1, 1], padding="SAME")
         weit = 1.0 + 5.0 * tf.abs(avg_pool - y_true_f)
 
-        # 2. Weighted BCE loss with logits
+        # Weighted BCE loss with logits
         bce_raw = tf.nn.sigmoid_cross_entropy_with_logits(labels=y_true_f, logits=y_pred_logits)
         wbce = tf.reduce_sum(weit * bce_raw, axis=[1, 2, 3]) / (tf.reduce_sum(weit, axis=[1, 2, 3]) + 1e-8)
 
-        # 3. Weighted IoU loss
+        # Weighted IoU loss
         pred_sig = tf.nn.sigmoid(y_pred_logits)
         inter = tf.reduce_sum((pred_sig * y_true_f) * weit, axis=[1, 2, 3])
         union = tf.reduce_sum((pred_sig + y_true_f) * weit, axis=[1, 2, 3])
@@ -429,28 +422,36 @@ class DGNetLoss(losses.Loss):
     def call(self, y_true: tf.Tensor, y_pred_dict: Dict[str, tf.Tensor]) -> tf.Tensor:
         mask_logits = y_pred_dict["mask_pred"]
         grad_logits = y_pred_dict["grad_pred"]
-        gt_grad = y_pred_dict["gt_grad"]
 
         seg_loss = self.structure_loss(y_true, mask_logits)
-        grad_pred_sig = tf.nn.sigmoid(grad_logits)
-        grad_loss = tf.reduce_mean(tf.square(gt_grad - grad_pred_sig))
 
-        total_loss = seg_loss + self.lambda_grad_loss * grad_loss
+        # Auxiliary gradient loss (MSE)
+        grad_gt_target = y_pred_dict.get("gt_grad", y_pred_dict.get("grad_gt", None))
+        if grad_gt_target is not None:
+            gt_grad = tf.cast(grad_gt_target, tf.float32)
+            grad_pred_val = tf.clip_by_value(grad_logits, 0.0, 1.0)
+            grad_loss = tf.reduce_mean(tf.square(grad_pred_val - gt_grad))
+            total_loss = seg_loss + self.lambda_grad_loss * grad_loss
+        else:
+            total_loss = seg_loss
+
         return total_loss
 
 
 def build_dgnet_model(
     backbone_name: str = "mobilenet_v3_large",
     input_shape: Tuple[int, int, int] = (384, 384, 3),
-    gradient_kernel: str = "sobel",
+    channel: int = 64,
+    gradient_kernel: Optional[str] = None,
     num_classes: int = 1,
-    pretrained: bool = True
+    pretrained: bool = True,
+    **kwargs
 ) -> DGNet:
-    """Factory helper function to instantiate DGNet in TensorFlow."""
+    """Factory helper function to instantiate official DGNet model."""
     return DGNet(
         backbone_name=backbone_name,
         input_shape=input_shape,
-        gradient_kernel=gradient_kernel,
-        num_classes=num_classes,
-        pretrained=pretrained
+        channel=channel,
+        pretrained=pretrained,
+        **kwargs
     )
