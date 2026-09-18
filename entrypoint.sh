@@ -31,7 +31,7 @@ export CHECKPOINT_DIR="$CKPT_DIR_RESOLVED"
 export LOG_DIR="$LOG_DIR_RESOLVED"
 
 # MLflow Experiment Tracking & Hugging Face S3 Gateway Defaults
-export MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-http://44.211.142.88:5000}"
+export MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-}"
 export MLFLOW_EXPERIMENT_NAME="${MLFLOW_EXPERIMENT_NAME:-COD-Camouflage-Detection}"
 export MLFLOW_S3_ENDPOINT_URL="${MLFLOW_S3_ENDPOINT_URL:-https://s3.hf.co/gouravbirwaz}"
 export AWS_ENDPOINT_URL_S3="${AWS_ENDPOINT_URL_S3:-https://s3.hf.co/gouravbirwaz}"
@@ -75,7 +75,7 @@ if [ "$RESUME" = "true" ] || [ "$RESUME" = "1" ]; then
     RESUME_FLAG="--resume"
 fi
 
-python3 scripts/DGnet.py \
+python3 -u scripts/DGnet.py \
     --train \
     --epochs ${EPOCHS:-50} \
     --batch-size ${BATCH_SIZE:-16} \
@@ -84,7 +84,7 @@ python3 scripts/DGnet.py \
     --log-dir "$LOG_DIR_RESOLVED" \
     --version "${MODEL_VERSION:-v2.0_official_dgnet}" \
     --export-tflite \
-    $RESUME_FLAG
+    $RESUME_FLAG 2>&1 | tee -a /tmp/training_output.log
 
 # 3. Upload Checkpoints and Logs back to HF Storage Bucket
 echo ""

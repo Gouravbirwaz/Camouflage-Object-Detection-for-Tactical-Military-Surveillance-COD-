@@ -105,31 +105,47 @@ class MLflowTracker:
 
         if not MLFLOW_AVAILABLE:
             print("[MLflow] Notice: 'mlflow' package is not installed. Tracking disabled.")
-        elif not self.enabled:
+        elif not self.enabled or not self.tracking_uri:
             print("[MLflow] Notice: MLFLOW_TRACKING_URI not set. Running in offline/no-op mode.")
+            self.enabled = False
         else:
-            try:
-                mlflow.set_tracking_uri(self.tracking_uri)
-                # Create experiment with explicit S3 artifact location if not already existing
+            # Fast probe to prevent 10+ minute freeze if remote tracking host is offline/unreachable
+            if self.tracking_uri.startswith(("http://", "https://")):
+                import socket
+                from urllib.parse import urlparse
+                parsed = urlparse(self.tracking_uri)
+                host = parsed.hostname
+                port = parsed.port or (443 if parsed.scheme == "https" else 80)
                 try:
-                    client = MlflowClient(tracking_uri=self.tracking_uri)
-                    exp = client.get_experiment_by_name(self.experiment_name)
-                    if exp is None:
-                        client.create_experiment(
-                            name=self.experiment_name,
-                            artifact_location=self.artifact_location
-                        )
-                        print(f"[MLflow] Created experiment '{self.experiment_name}' with S3 artifact root: {self.artifact_location}")
-                except Exception as exp_err:
-                    # Non-fatal if server already has experiment or manages artifact root
-                    pass
+                    sock = socket.create_connection((host, port), timeout=2.0)
+                    sock.close()
+                except Exception as conn_err:
+                    print(f"[MLflow] Notice: Remote tracking server at {self.tracking_uri} is unreachable ({conn_err}).")
+                    print("[MLflow] Disabling remote MLflow tracking to run training without network delays.")
+                    self.enabled = False
 
-                mlflow.set_experiment(self.experiment_name)
-                print(f"[MLflow] Initialized tracking at: {self.tracking_uri} | Experiment: '{self.experiment_name}'")
-                print(f"[MLflow] S3 Artifact Store: {self.artifact_location} (Endpoint: {s3_endpoint})")
-            except Exception as e:
-                print(f"[MLflow] Warning: Failed to connect to tracking URI ({e}). Falling back to no-op mode.")
-                self.enabled = False
+            if self.enabled:
+                try:
+                    mlflow.set_tracking_uri(self.tracking_uri)
+                    # Create experiment with explicit S3 artifact location if not already existing
+                    try:
+                        client = MlflowClient(tracking_uri=self.tracking_uri)
+                        exp = client.get_experiment_by_name(self.experiment_name)
+                        if exp is None:
+                            client.create_experiment(
+                                name=self.experiment_name,
+                                artifact_location=self.artifact_location
+                            )
+                            print(f"[MLflow] Created experiment '{self.experiment_name}' with S3 artifact root: {self.artifact_location}")
+                    except Exception:
+                        pass
+
+                    mlflow.set_experiment(self.experiment_name)
+                    print(f"[MLflow] Initialized tracking at: {self.tracking_uri} | Experiment: '{self.experiment_name}'")
+                    print(f"[MLflow] S3 Artifact Store: {self.artifact_location} (Endpoint: {s3_endpoint})")
+                except Exception as e:
+                    print(f"[MLflow] Warning: Failed to connect to tracking URI ({e}). Falling back to no-op mode.")
+                    self.enabled = False
 
     def start_run(
         self,

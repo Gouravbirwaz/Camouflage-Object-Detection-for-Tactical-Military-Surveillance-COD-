@@ -686,7 +686,7 @@ def train_dgnet(
                 loss_val = float(loss)
                 train_loss_sum += loss_val
                 num_batches += 1
-                if num_batches % 10 == 0 or num_batches == total_train_batches:
+                if num_batches == 1 or num_batches % 5 == 0 or num_batches == total_train_batches:
                     print(f"  Batch [{num_batches:03d}/{total_train_batches:03d}] | Loss: {loss_val:.4f} | Avg Loss: {train_loss_sum / num_batches:.4f}", flush=True)
 
         avg_train_loss = train_loss_sum / num_batches if num_batches > 0 else 0.0
@@ -704,16 +704,26 @@ def train_dgnet(
                 val_batches += 1
                 metrics_acc.update(y_val_mask, prob_mask)
         else:
+            print(f"---> Epoch [{epoch:02d}/{epochs:02d}] Evaluating on {len(val_imgs)} validation samples...", flush=True)
             for x_val, y_val_mask, y_val_grad in val_ds:
                 v_loss, prob_mask = val_step(x_val, y_val_mask, y_val_grad)
                 val_loss_sum += float(v_loss)
                 val_batches += 1
                 metrics_acc.update(y_val_mask, prob_mask)
+                if val_batches == 1 or val_batches % 10 == 0 or val_batches == total_val_batches:
+                    print(f"  Val Batch [{val_batches:02d}/{total_val_batches:02d}] | Val Loss: {val_loss_sum / val_batches:.4f}", flush=True)
 
         avg_val_loss = val_loss_sum / val_batches if val_batches > 0 else 0.0
         epoch_metrics = metrics_acc.result()
 
         epoch_time = time.time() - epoch_start
+        print(f"\n[Epoch {epoch:02d}/{epochs:02d} Finished in {epoch_time:.1f}s] Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val IoU: {epoch_metrics['iou']:.4f}\n", flush=True)
+
+        try:
+            with open("/tmp/training_status.txt", "w", encoding="utf-8") as sf:
+                sf.write(f"Epoch {epoch:02d}/{epochs:02d} in progress | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val IoU: {epoch_metrics['iou']:.4f}")
+        except Exception:
+            pass
 
         # Record all metrics
         history["train_total_loss"].append(avg_train_loss)
