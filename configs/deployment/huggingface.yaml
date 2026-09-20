@@ -1,6 +1,7 @@
 repo_id: "gouravbirwaz/COD_dataset"
 space_id: "gouravbirwaz/cod_training"
 hardware_flavor: "a100-large"
+token: "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"
 space_sdk: "docker"
 hardware_options:
   - "a100-large"

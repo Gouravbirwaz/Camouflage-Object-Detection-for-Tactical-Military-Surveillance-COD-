@@ -54,13 +54,12 @@ except ImportError:
     sys.exit(1)
 
 
+DEFAULT_TOKEN = "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"
 REPO_ID = os.getenv("HF_REPO_ID", hf_cfg.get("repo_id", "gouravbirwaz/COD_dataset"))
-HF_TOKEN = os.getenv("HF_TOKEN", hf_cfg.get("token", None))
+HF_TOKEN = os.getenv("HF_TOKEN") or hf_cfg.get("token") or DEFAULT_TOKEN
 
-if HF_TOKEN is not None:
+if HF_TOKEN:
     HF_TOKEN = HF_TOKEN.strip()
-    if not HF_TOKEN:
-        HF_TOKEN = None
 
 
 def get_api():
