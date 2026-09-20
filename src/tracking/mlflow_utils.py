@@ -23,6 +23,13 @@ try:
 except ImportError:
     MLFLOW_AVAILABLE = False
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def _resolve_path(path_str: str) -> Path:
+    p = Path(path_str)
+    return p if p.is_absolute() else PROJECT_ROOT / p
+
 
 def get_git_commit_sha() -> Optional[str]:
     """Safely retrieves the current Git commit SHA without throwing errors."""
@@ -117,11 +124,12 @@ class MLflowTracker:
         db_dir.mkdir(parents=True, exist_ok=True)
         db_file = db_dir / "mlflow.db"
         
-        # Absolute SQLite URI with 4 slashes for Linux/Windows compatibility
-        clean_db_str = str(db_file.resolve()).replace("\\", "/")
-        if not clean_db_str.startswith("/"):
-            clean_db_str = "/" + clean_db_str
-        direct_sqlite_uri = f"sqlite:///{clean_db_str}"
+        # Absolute SQLite URI formatted for Linux and Windows compatibility
+        posix_path = db_file.resolve().as_posix()
+        if posix_path.startswith("/"):
+            direct_sqlite_uri = f"sqlite:////{posix_path.lstrip('/')}"
+        else:
+            direct_sqlite_uri = f"sqlite:///{posix_path}"
 
         # Probe remote HTTP tracking URI if specified
         is_remote_http = False
