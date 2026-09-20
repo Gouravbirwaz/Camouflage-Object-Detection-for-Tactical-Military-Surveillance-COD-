@@ -222,7 +222,7 @@ def upload_logs(log_dir: str = None):
         print(f"[HF Sync] Log directory {primary_path.resolve()} does not exist.")
         return
 
-    print(f"\n[HF Sync] Uploading training logs & MLflow metrics folder from {primary_path.resolve()} to '{REPO_ID}' (path_in_repo='logs')...")
+    print(f"\n[HF Sync] Uploading training logs & MLflow metrics folder from {primary_path.resolve()} to '{REPO_ID}' (path_in_repo='metrics')...")
     api = get_api()
     try:
         api.create_repo(repo_id=REPO_ID, repo_type="dataset", exist_ok=True, token=HF_TOKEN)
@@ -232,7 +232,7 @@ def upload_logs(log_dir: str = None):
     try:
         api.upload_folder(
             folder_path=str(primary_path.resolve()),
-            path_in_repo="logs",
+            path_in_repo="metrics",
             repo_id=REPO_ID,
             repo_type="dataset",
             token=HF_TOKEN
@@ -255,7 +255,7 @@ def download_logs(log_dir: str = None):
             repo_id=REPO_ID,
             repo_type="dataset",
             local_dir=str(PROJECT_ROOT),
-            allow_patterns="logs/*",
+            allow_patterns=["metrics/*", "metrics/**", "logs/*", "logs/**"],
             token=HF_TOKEN
         )
         # If downloaded into logs/, copy/move to metrics/

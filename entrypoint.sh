@@ -99,7 +99,7 @@ fi
 
 python3 -u scripts/DGnet.py \
     --train \
-    --epochs ${EPOCHS:-50} \
+    --epochs ${EPOCHS:-10} \
     --batch-size ${BATCH_SIZE:-8} \
     --data-dir ${DATA_DIR:-data/raw/dataset-splitM} \
     --checkpoint-dir "$CKPT_DIR_RESOLVED" \
