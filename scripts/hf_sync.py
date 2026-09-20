@@ -242,7 +242,8 @@ def upload_logs(log_dir: str = None):
                 for item in cp.rglob("*"):
                     if item.is_file() and not item.name.startswith("."):
                         rel = str(item.relative_to(cp)).replace("\\", "/")
-                        files_to_upload[rel] = item
+                        if rel not in files_to_upload or item.stat().st_mtime > files_to_upload[rel].stat().st_mtime:
+                            files_to_upload[rel] = item
         except Exception:
             pass
 

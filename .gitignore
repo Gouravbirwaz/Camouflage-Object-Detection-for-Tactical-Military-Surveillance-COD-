@@ -96,3 +96,5 @@ tests/unit/output/
 .DS_Store
 Thumbs.db
 tests/unit/output
+
+data/augmented

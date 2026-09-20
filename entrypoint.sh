@@ -30,14 +30,21 @@ fi
 export CHECKPOINT_DIR="$CKPT_DIR_RESOLVED"
 export LOG_DIR="$LOG_DIR_RESOLVED"
 
-# MLflow Experiment Tracking & Hugging Face S3 Gateway Defaults
+# MLflow Experiment Tracking Defaults & Hugging Face S3 Gateway Setup
 export MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-http://127.0.0.1:5000}"
 export MLFLOW_EXPERIMENT_NAME="${MLFLOW_EXPERIMENT_NAME:-COD-Camouflage-Detection}"
-export MLFLOW_S3_ENDPOINT_URL="${MLFLOW_S3_ENDPOINT_URL:-https://s3.hf.co/gouravbirwaz}"
-export AWS_ENDPOINT_URL_S3="${AWS_ENDPOINT_URL_S3:-https://s3.hf.co/gouravbirwaz}"
-export MLFLOW_ARTIFACT_LOCATION="${MLFLOW_ARTIFACT_LOCATION:-s3://COD_dataset/dvc-store/mlflow-artifacts}"
-export HF_S3_URI="${HF_S3_URI:-s3://COD_dataset/dvc-store}"
-export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+
+if [ -n "$HF_TOKEN" ]; then
+    echo "[MLflow HF S3 Gateway] Configured Hugging Face S3 Endpoint (s3.hf.co) for MLflow artifact storage."
+    export MLFLOW_S3_ENDPOINT_URL="${MLFLOW_S3_ENDPOINT_URL:-https://s3.hf.co}"
+    export AWS_ENDPOINT_URL_S3="${AWS_ENDPOINT_URL_S3:-https://s3.hf.co}"
+    export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-hf}"
+    export AWS_SECRET_ACCESS_KEY="$HF_TOKEN"
+    export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+    export MLFLOW_ARTIFACT_LOCATION="${MLFLOW_ARTIFACT_LOCATION:-s3://gouravbirwaz/COD_dataset/mlflow-artifacts}"
+else
+    export MLFLOW_ARTIFACT_LOCATION="${LOG_DIR_RESOLVED}/mlflow_artifacts"
+fi
 
 # Ensure all candidate checkpoint & log directories exist
 mkdir -p "$CKPT_DIR_RESOLVED"
@@ -81,7 +88,7 @@ if [ -d "/data/dvc-store" ] || [ -d "/data/files" ]; then
     dvc checkout data/raw.dvc 2>/dev/null || dvc checkout 2>/dev/null || echo "Notice: DVC checkout completed with notes."
 fi
 
-python3 scripts/hf_sync.py --download-checkpoints --ckpt-dir "$CKPT_DIR_RESOLVED" --download-dataset || echo "Notice: Checkpoint/dataset sync skipped or using mounted S3 dataset."
+python3 scripts/hf_sync.py --download-checkpoints --ckpt-dir "$CKPT_DIR_RESOLVED" --download-dataset --download-logs --log-dir "$LOG_DIR_RESOLVED" || echo "Notice: Checkpoint/dataset/logs sync skipped or using mounted S3 dataset."
 
 # 2. Run DGNet Preprocessing & Training
 echo ""

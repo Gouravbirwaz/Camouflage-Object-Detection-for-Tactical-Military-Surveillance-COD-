@@ -47,7 +47,8 @@ ENV MLFLOW_EXPERIMENT_NAME=COD-Camouflage-Detection
 ENV MLFLOW_S3_ENDPOINT_URL=https://s3.hf.co/gouravbirwaz
 ENV AWS_ENDPOINT_URL_S3=https://s3.hf.co/gouravbirwaz
 ENV MLFLOW_ARTIFACT_LOCATION=s3://COD_dataset/dvc-store/mlflow-artifacts
-ENV HF_S3_URI=s3://COD_dataset/dvc-store
+ENV HF_S3_URI=s3://COD_dataset/dvc-storecls
+
 ENV AWS_DEFAULT_REGION=us-east-1
 
 # Expose port for HF Space health checks

@@ -48,6 +48,7 @@ from src.models.dgnet import DGNet, DGNetLoss, build_dgnet_model
 from src.utils.config import load_project_config
 from src.utils.metrics import CODMetricsAccumulator
 from src.tracking.mlflow_utils import MLflowTracker
+from src.data.augmentation import tf_random_military_fog_smoke, tf_random_thermal_noise
 
 
 def setup_gpu_environment():
@@ -190,7 +191,7 @@ def discover_dataset_pairs(data_dir: Path) -> Dict[str, Tuple[List[str], List[st
     req_path = Path(data_dir)
     candidate_paths = []
 
-    # Priority candidate paths
+    # Priority candidate paths (original raw data only — augmented data is merged separately in train_dgnet)
     if req_path.is_absolute():
         candidate_paths.append(req_path)
     else:
@@ -451,28 +452,31 @@ def create_tf_dataset(
             mask = tf.image.rot90(mask, k=k)
             grad_gt = tf.image.rot90(grad_gt, k=k)
 
-            # --- Photometric Augmentations (applied to image only) ---
+            # --- Military Surveillance Scenario Tactical Augmentations ---
 
-            # 5. Color jitter on unnormalized [0, 1] image
+            # 5. Fog / Smoke Screen Simulation (30% probability)
+            if tf.random.uniform(()) > 0.7:
+                img = tf_random_military_fog_smoke(img)
+
+            # 6. Thermal & Electro-Optical Sensor Noise (30% probability)
+            if tf.random.uniform(()) > 0.7:
+                img = tf_random_thermal_noise(img)
+
+            # 7. Color Jitter & Illumination Shift
             img = tf.image.random_brightness(img, max_delta=0.2)
             img = tf.image.random_contrast(img, lower=0.7, upper=1.3)
             img = tf.image.random_saturation(img, lower=0.7, upper=1.3)
             img = tf.image.random_hue(img, max_delta=0.05)
             img = tf.clip_by_value(img, 0.0, 1.0)
 
-            # 6. Gaussian blur (30% probability): blur-invariant feature learning
-            if tf.random.uniform(()) > 0.7:
-                img = _gaussian_blur_tf(img, sigma_min=0.3, sigma_max=1.5)
+            # 8. Gaussian Blur / Heat Defocus (35% probability)
+            if tf.random.uniform(()) > 0.65:
+                img = _gaussian_blur_tf(img, sigma_min=0.3, sigma_max=1.8)
                 img = tf.clip_by_value(img, 0.0, 1.0)
 
-            # 7. CutOut / Random Erasing (40% probability): prevents region-specific overfitting
+            # 9. CutOut / Foliage Mesh Occlusion (40% probability)
             if tf.random.uniform(()) > 0.6:
                 img = _cutout_tf(img, max_fraction=0.25)
-
-            # 8. Random Gaussian noise (20% probability): noise robustness
-            if tf.random.uniform(()) > 0.8:
-                noise = tf.random.normal(tf.shape(img), mean=0.0, stddev=0.03)
-                img = tf.clip_by_value(img + noise, 0.0, 1.0)
 
             # Apply ImageNet normalization at the end
             img_norm = (img - IMAGENET_MEAN) / IMAGENET_STD
@@ -546,7 +550,7 @@ def train_dgnet(
     metrics_log_dir = Path(log_dir) if Path(log_dir).is_absolute() else PROJECT_ROOT / log_dir
     metrics_log_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Discover Real Dataset
+    # 1. Discover Real Dataset (original raw data)
     splits = discover_dataset_pairs(data_path)
     if not splits:
         raise FileNotFoundError(f"No paired images and masks found in target directory: {data_path.resolve()}")
@@ -564,6 +568,26 @@ def train_dgnet(
         val_idx = int(len(all_imgs) * 0.8)
         train_imgs, train_masks = all_imgs[:val_idx], all_masks[:val_idx]
         val_imgs, val_masks = all_imgs[val_idx:], all_masks[val_idx:]
+
+    # 1b. Merge augmented military tactical training data (if available)
+    augmented_dirs = [
+        PROJECT_ROOT / "data" / "augmented" / "military_tactical",
+        Path("/data/augmented/military_tactical"),
+    ]
+    for aug_dir in augmented_dirs:
+        try:
+            aug_splits = _find_dataset_splits_in_dir(aug_dir, {".jpg", ".jpeg", ".png", ".bmp", ".webp"})
+            if aug_splits:
+                for split_name, (aug_imgs, aug_masks) in aug_splits.items():
+                    if split_name.lower() in ["training", "train", "default"]:
+                        orig_count = len(train_imgs)
+                        train_imgs.extend(aug_imgs)
+                        train_masks.extend(aug_masks)
+                        print(f"\n[Dataset Merge] Merged {len(aug_imgs)} augmented military tactical samples from: {aug_dir.resolve()}")
+                        print(f"  • Original Training: {orig_count} | Augmented: {len(aug_imgs)} | Combined: {len(train_imgs)}")
+                break  # Use the first augmented directory found
+        except Exception:
+            continue
 
     print(f"\n[Training Setup] Training Version: {version_tag} | Training Samples: {len(train_imgs)} | Validation Samples: {len(val_imgs)}")
 
@@ -671,8 +695,16 @@ def train_dgnet(
     best_val_iou = 0.0
     best_val_iou_epoch = 0
     best_val_loss_epoch = 0
-    early_stop_patience = 10
+    early_stop_patience = 15
     epochs_without_improvement = 0
+
+    # Sync previous logs from Hugging Face if running in HF environment or configured
+    if os.getenv("TRAINING_PLATFORM", "huggingface").lower() in ("huggingface", "hf", "true", "1") and os.getenv("HF_TOKEN"):
+        try:
+            from scripts.hf_sync import download_logs
+            download_logs(str(metrics_log_dir))
+        except Exception as e:
+            print(f"[HF Sync] Initial log sync notice: {e}")
 
     # Initialize MLflow experiment tracking (configured via MLFLOW_TRACKING_URI env var)
     mlflow_tracker = MLflowTracker(
@@ -755,12 +787,8 @@ def train_dgnet(
     def train_step(x_b, y_m, y_g):
         with tf.GradientTape() as tape:
             preds = model(x_b, training=True, return_dict=True)
-            preds_dict = {
-                "mask_pred": preds["mask_pred"],
-                "grad_pred": preds["grad_pred"],
-                "gt_grad": y_g
-            }
-            loss = loss_fn(y_m, preds_dict)
+            preds["gt_grad"] = y_g
+            loss = loss_fn(y_m, preds)
         grads = tape.gradient(loss, model.trainable_variables)
         optimizer.apply_gradients(zip(grads, model.trainable_variables))
         return loss
@@ -768,12 +796,8 @@ def train_dgnet(
     @tf.function
     def val_step(x_b, y_m, y_g):
         val_preds = model(x_b, training=False, return_dict=True)
-        val_preds_dict = {
-            "mask_pred": val_preds["mask_pred"],
-            "grad_pred": val_preds["grad_pred"],
-            "gt_grad": y_g
-        }
-        v_loss = loss_fn(y_m, val_preds_dict)
+        val_preds["gt_grad"] = y_g
+        v_loss = loss_fn(y_m, val_preds)
         prob_mask = tf.nn.sigmoid(val_preds["mask_pred"])
         return v_loss, prob_mask
 
@@ -1049,7 +1073,23 @@ def train_dgnet(
     })
     if metrics_log_path.exists():
         mlflow_tracker.log_artifact(str(metrics_log_path.resolve()), artifact_path="metrics")
+
+    # Production ML Engineer artifacts: Model Architecture, Registered MLflow Model, Plots, & Quantized Edge Models
+    mlflow_tracker.log_model_summary(model)
+    mlflow_tracker.log_model(model, artifact_path="model", registered_model_name="DGNet-Camouflage-Detector")
+    mlflow_tracker.log_plots(str(metrics_log_dir))
+    mlflow_tracker.log_quantized_models()
+
     mlflow_tracker.end_run(status="FINISHED")
+
+    # Final upload of logs, MLflow artifacts, and checkpoints to Hugging Face
+    if os.getenv("TRAINING_PLATFORM", "huggingface").lower() in ("huggingface", "hf", "true", "1") and os.getenv("HF_TOKEN"):
+        try:
+            from scripts.hf_sync import upload_logs, upload_checkpoints
+            upload_logs(str(metrics_log_dir))
+            upload_checkpoints(str(ckpt_dir))
+        except Exception as e:
+            print(f"[HF Sync] Final upload notice: {e}")
 
 
 def evaluate_dgnet(data_dir: str = "data/raw/dataset-splitM", checkpoint_dir: str = "models/raw_checkpoints", log_dir: str = "metrics", backbone: str = "mobilenet_v3_large", kernel: str = "sobel", model_version: str = None):
@@ -1250,7 +1290,7 @@ def main():
     default_backbone = model_cfg.get("context_backbone", "mobilenet_v3_large")
     default_kernel = model_cfg.get("gradient_kernel", "sobel")
     default_img_size = tuple(data_cfg.get("image_size", [384, 384]))
-    default_epochs = train_cfg.get("epochs", 10)
+    default_epochs = train_cfg.get("epochs", 50)
     default_batch_size = train_cfg.get("batch_size", data_cfg.get("batch_size", 8))
     default_lr = train_cfg.get("learning_rate", 0.0001)
     default_tflite_path = train_cfg.get("tflite_export_path", "models/quantized/dgnet_s_int8.tflite")

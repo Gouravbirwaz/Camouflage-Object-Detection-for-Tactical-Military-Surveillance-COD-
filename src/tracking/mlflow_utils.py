@@ -83,36 +83,49 @@ class MLflowTracker:
         artifact_location: Optional[str] = None,
         enabled: Optional[bool] = None,
     ):
-        # Configure Hugging Face S3 endpoint for boto3 / MLflow artifact storage
-        s3_endpoint = os.getenv("MLFLOW_S3_ENDPOINT_URL", "https://s3.hf.co/gouravbirwaz")
-        os.environ.setdefault("MLFLOW_S3_ENDPOINT_URL", s3_endpoint)
-        os.environ.setdefault("AWS_ENDPOINT_URL_S3", s3_endpoint)
-        os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
+        # Configure Hugging Face S3 Gateway (s3.hf.co) for boto3 / MLflow artifact storage
+        hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+        if hf_token:
+            hf_token = hf_token.strip()
+            s3_endpoint = os.getenv("MLFLOW_S3_ENDPOINT_URL", "https://s3.hf.co")
+            os.environ.setdefault("MLFLOW_S3_ENDPOINT_URL", s3_endpoint)
+            os.environ.setdefault("AWS_ENDPOINT_URL_S3", s3_endpoint)
+            os.environ.setdefault("AWS_ACCESS_KEY_ID", "hf")
+            os.environ.setdefault("AWS_SECRET_ACCESS_KEY", hf_token)
+            os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 
         # Priority: explicit arg > env var > default
-        self.tracking_uri = tracking_uri or os.getenv("MLFLOW_TRACKING_URI")
+        self.remote_tracking_uri = tracking_uri or os.getenv("MLFLOW_TRACKING_URI")
         self.experiment_name = (
             experiment_name
             or os.getenv("MLFLOW_EXPERIMENT_NAME")
             or "COD-Camouflage-Detection"
         )
+
+        # Hugging Face S3 Gateway vs Local Fallback for artifacts
+        local_artifacts_path = (PROJECT_ROOT / "metrics" / "mlflow_db" / "artifacts").resolve()
+        local_artifacts_path.mkdir(parents=True, exist_ok=True)
+        default_artifact_loc = "s3://gouravbirwaz/COD_dataset/mlflow-artifacts" if hf_token else local_artifacts_path.as_uri()
+
         self.artifact_location = (
             artifact_location
             or os.getenv("MLFLOW_ARTIFACT_LOCATION")
-            or "s3://COD_dataset/dvc-store/mlflow-artifacts"
+            or default_artifact_loc
         )
 
-        # Enable only if MLflow library is installed AND tracking URI is configured (or explicitly forced)
+        # Respect explicit enabled=False; otherwise ALWAYS enable if mlflow is installed
         if enabled is not None:
             self.enabled = enabled and MLFLOW_AVAILABLE
         else:
-            self.enabled = bool(self.tracking_uri) and MLFLOW_AVAILABLE
+            self.enabled = MLFLOW_AVAILABLE
 
         self.active_run = None
 
         if not MLFLOW_AVAILABLE:
             print("[MLflow] Notice: 'mlflow' package is not installed. Tracking disabled.")
-        # Determine resolved metrics directory for direct SQLite storage
+            return
+
+        # Build persistent local SQLite DB path (travels with the repo across platforms)
         log_dir_env = os.getenv("LOG_DIR", "metrics")
         resolved_log_dir = _resolve_path(log_dir_env)
         for cand in [Path("/data/metrics"), Path("/app/metrics"), PROJECT_ROOT / "metrics"]:
@@ -146,34 +159,28 @@ class MLflowTracker:
         else:
             direct_sqlite_uri = f"sqlite:///{posix_path}"
 
-        # Probe remote HTTP tracking URI if specified
-        is_remote_http = False
-        if self.tracking_uri and self.tracking_uri.startswith(("http://", "https://")):
-            if not any(lh in self.tracking_uri for lh in ("127.0.0.1", "localhost", "0.0.0.0")):
+        # Determine final tracking URI: try remote HTTP first, always fall back to local SQLite
+        self.tracking_uri = direct_sqlite_uri  # Default: always persist locally
+        if self.remote_tracking_uri and self.remote_tracking_uri.startswith(("http://", "https://")):
+            if not any(lh in self.remote_tracking_uri for lh in ("127.0.0.1", "localhost", "0.0.0.0")):
                 import socket
                 from urllib.parse import urlparse
-                parsed = urlparse(self.tracking_uri)
+                parsed = urlparse(self.remote_tracking_uri)
                 host = parsed.hostname
                 port = parsed.port or (443 if parsed.scheme == "https" else 80)
                 try:
                     sock = socket.create_connection((host, port), timeout=2.0)
                     sock.close()
-                    is_remote_http = True
+                    self.tracking_uri = self.remote_tracking_uri
+                    print(f"[MLflow] Connected to remote tracking server: {self.remote_tracking_uri}")
                 except Exception as conn_err:
-                    print(f"[MLflow] Notice: Remote server at {self.tracking_uri} unreachable ({conn_err}).")
-                    print(f"[MLflow] Routing tracking directly to SQLite database file: {db_file}")
+                    print(f"[MLflow] Notice: Remote server at {self.remote_tracking_uri} unreachable ({conn_err}).")
+                    print(f"[MLflow] Persisting tracking to local SQLite: {db_file}")
 
-        if not is_remote_http:
-            self.tracking_uri = direct_sqlite_uri
-
-        self.enabled = MLFLOW_AVAILABLE
-
-        if not MLFLOW_AVAILABLE:
-            print("[MLflow] Notice: 'mlflow' package is not installed. Tracking disabled.")
-        elif self.enabled:
+        if self.enabled:
             try:
                 mlflow.set_tracking_uri(self.tracking_uri)
-                # Create experiment with explicit S3 artifact location if not already existing
+                # Create experiment with explicit artifact location if not already existing
                 try:
                     client = MlflowClient(tracking_uri=self.tracking_uri)
                     exp = client.get_experiment_by_name(self.experiment_name)
@@ -182,14 +189,16 @@ class MLflowTracker:
                             name=self.experiment_name,
                             artifact_location=self.artifact_location
                         )
-                        print(f"[MLflow] Created experiment '{self.experiment_name}' at {self.tracking_uri}")
+                        print(f"[MLflow] Created experiment '{self.experiment_name}'")
                 except Exception:
                     pass
 
                 mlflow.set_experiment(self.experiment_name)
-                print(f"[MLflow] Initialized direct tracking at: {self.tracking_uri} | Experiment: '{self.experiment_name}'")
+                print(f"[MLflow] Persistent tracking active at: {self.tracking_uri}")
+                print(f"[MLflow] Experiment: '{self.experiment_name}' | Artifacts: {self.artifact_location}")
             except Exception as e:
-                print(f"[MLflow] Warning: Failed to set tracking URI ({e}).")
+                print(f"[MLflow] Warning: Failed to initialize tracking ({e}). Tracking disabled for this session.")
+                self.enabled = False
 
     def start_run(
         self,
@@ -342,6 +351,81 @@ class MLflowTracker:
             metadata["dvc_remote_store"] = str(dvc_remote)
 
         self.log_tags(metadata)
+
+    def log_model(
+        self,
+        model: Any,
+        artifact_path: str = "model",
+        registered_model_name: Optional[str] = "DGNet-Camouflage-Detector"
+    ):
+        """
+        Logs a TensorFlow/Keras model artifact and registers it in the MLflow Model Registry.
+        Standard production practice for ML Engineers.
+        """
+        if not self.enabled or not self.active_run:
+            return
+
+        try:
+            import mlflow.tensorflow
+            mlflow.tensorflow.log_model(
+                model=model,
+                artifact_path=artifact_path,
+                registered_model_name=registered_model_name
+            )
+            print(f"[MLflow] Logged & Registered model '{registered_model_name}' under artifact path '{artifact_path}'.")
+        except Exception as e:
+            print(f"[MLflow] Notice: Could not register model with MLflow flavor ({e}). Logging as raw artifact...")
+            try:
+                if hasattr(model, "save"):
+                    temp_path = PROJECT_ROOT / "metrics" / "temp_dgnet.keras"
+                    model.save(str(temp_path))
+                    self.log_artifact(str(temp_path), artifact_path=artifact_path)
+            except Exception as save_err:
+                print(f"[MLflow] Warning: Model artifact logging fallback failed: {save_err}")
+
+    def log_model_summary(self, model: Any):
+        """Logs the text summary of the model architecture (layers, parameters, shapes)."""
+        if not self.enabled or not self.active_run:
+            return
+
+        try:
+            summary_path = PROJECT_ROOT / "metrics" / "model_summary.txt"
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(summary_path, "w", encoding="utf-8") as f:
+                model.summary(print_fn=lambda x: f.write(x + "\n"))
+            self.log_artifact(str(summary_path), artifact_path="architecture")
+            print("[MLflow] Logged model architecture summary artifact.")
+        except Exception as e:
+            print(f"[MLflow] Warning: Failed to log model summary ({e})")
+
+    def log_plots(self, plots_dir: Optional[str] = None):
+        """Logs evaluation metric plots, confusion matrices, and IoU curves to MLflow UI."""
+        if not self.enabled or not self.active_run:
+            return
+
+        p_dir = Path(plots_dir) if plots_dir else (PROJECT_ROOT / "metrics")
+        if not p_dir.exists():
+            return
+
+        for plot_file in p_dir.glob("*.png"):
+            self.log_artifact(str(plot_file), artifact_path="plots")
+
+    def log_quantized_models(self, quantized_dir: Optional[str] = None):
+        """Logs TFLite quantized edge models (Int8/FP16) as production deployment artifacts."""
+        if not self.enabled or not self.active_run:
+            return
+
+        q_dir = Path(quantized_dir) if quantized_dir else (PROJECT_ROOT / "models" / "quantized")
+        if not q_dir.exists():
+            for cand in [Path("/data/models/quantized"), Path("/app/models/quantized")]:
+                if cand.exists():
+                    q_dir = cand
+                    break
+
+        if q_dir.exists():
+            for tflite_file in q_dir.glob("*.tflite"):
+                self.log_artifact(str(tflite_file), artifact_path="quantized_models")
+                print(f"[MLflow] Logged edge model artifact: {tflite_file.name}")
 
     def end_run(self, status: str = "FINISHED"):
         """Ends the active MLflow run."""

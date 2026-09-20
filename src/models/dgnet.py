@@ -223,11 +223,12 @@ class NeighborConnectionDecoder(layers.Layer):
         self.conv_upsample2 = ConvBR(channel, kernel_size=3, padding="same", name=f"{name}_u2" if name else None)
         self.conv_upsample3 = ConvBR(channel, kernel_size=3, padding="same", name=f"{name}_u3" if name else None)
         self.conv_upsample4 = ConvBR(channel, kernel_size=3, padding="same", name=f"{name}_u4" if name else None)
-        self.conv_upsample5 = ConvBR(2 * channel, kernel_size=3, padding="same", name=f"{name}_u5" if name else None)
+        self.conv_upsample5 = ConvBR(channel, kernel_size=3, padding="same", name=f"{name}_u5" if name else None)
 
-        self.conv_concat2 = ConvBR(2 * channel, kernel_size=3, padding="same", name=f"{name}_c2" if name else None)
-        self.conv_concat3 = ConvBR(3 * channel, kernel_size=3, padding="same", name=f"{name}_c3" if name else None)
-        self.conv4 = ConvBR(3 * channel, kernel_size=3, padding="same", name=f"{name}_c4" if name else None)
+        # Official DGNet: conv_concat takes concatenated 2*channel (128) and projects back to channel (64)
+        self.conv_concat2 = ConvBR(channel, kernel_size=3, padding="same", name=f"{name}_c2" if name else None)
+        self.conv_concat3 = ConvBR(channel, kernel_size=3, padding="same", name=f"{name}_c3" if name else None)
+        self.conv4 = ConvBR(channel, kernel_size=3, padding="same", name=f"{name}_c4" if name else None)
         # Dropout before final prediction heads to prevent decoder feature co-adaptation
         self.decoder_dropout = layers.Dropout(rate=dropout_rate, name=f"{name}_drop" if name else None) if dropout_rate > 0 else None
         self.conv5 = layers.Conv2D(1, kernel_size=1, use_bias=True, kernel_initializer="he_normal", name=f"{name}_c5" if name else None)
@@ -295,7 +296,7 @@ class TextureEncoder(layers.Layer):
 class ContextEncoder(layers.Layer):
     """
     Context Encoder: Multi-scale semantic feature extractor across strides 8, 16, 32.
-    Supports MobileNetV3Large, EfficientNetB1 (official DGNet-S), and EfficientNetB4 (official DGNet).
+    Supports MobileNetV3Large, EfficientNetB1 (official DGNet-S), EfficientNetB4 (official DGNet), and ResNet50.
     """
 
     def __init__(
@@ -310,7 +311,11 @@ class ContextEncoder(layers.Layer):
         self.backbone_name = backbone_name.lower().replace("-", "_")
         weights = "imagenet" if pretrained else None
 
-        if "efficientnet_b1" in self.backbone_name:
+        if "resnet50" in self.backbone_name:
+            base = tf.keras.applications.ResNet50(include_top=False, weights=weights, input_shape=input_shape)
+            x3_name, x4_name, x5_name = "conv3_block4_out", "conv4_block6_out", "conv5_block3_out"
+            self.in_channels = [512, 1024, 2048]
+        elif "efficientnet_b1" in self.backbone_name:
             base = tf.keras.applications.EfficientNetB1(include_top=False, weights=weights, input_shape=input_shape)
             x3_name, x4_name, x5_name = "block3c_add", "block5d_add", "block7b_add"
             self.in_channels = [40, 112, 320]
