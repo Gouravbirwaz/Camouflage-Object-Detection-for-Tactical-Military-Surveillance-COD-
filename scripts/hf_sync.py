@@ -217,51 +217,59 @@ def upload_logs(log_dir: str = None):
     if log_dir is None:
         log_dir = os.getenv("LOG_DIR", train_cfg.get("log_dir", "metrics"))
 
-
     primary_path = _resolve_path(log_dir)
-
-    candidate_paths = [
-        primary_path,
-        Path("/data/metrics"),
-        Path("/app/metrics"),
-        PROJECT_ROOT / "metrics",
-    ]
-
-    files_to_upload = {}
-    for cp in candidate_paths:
-        try:
-            if cp.exists() and cp.is_dir():
-                for f in cp.glob("*"):
-                    if f.is_file() and not f.name.startswith("."):
-                        files_to_upload[f.name] = f
-        except Exception:
-            continue
-
-    if not files_to_upload:
-        print(f"[HF Sync] Log directory/directories do not contain log files to upload.")
+    if not primary_path.exists():
+        print(f"[HF Sync] Log directory {primary_path.resolve()} does not exist.")
         return
 
-    print(f"\n[HF Sync] Uploading {len(files_to_upload)} training/evaluation log(s)...")
+    print(f"\n[HF Sync] Uploading training logs & MLflow metrics folder from {primary_path.resolve()} to '{REPO_ID}' (path_in_repo='logs')...")
     api = get_api()
     try:
         api.create_repo(repo_id=REPO_ID, repo_type="dataset", exist_ok=True, token=HF_TOKEN)
     except Exception as e:
         print(f"[HF Sync] Repository creation note: {e}")
 
-    for filename, file_path in files_to_upload.items():
-        try:
-            print(f"  • Uploading log {filename} from {file_path.parent}...")
-            api.upload_file(
-                path_or_fileobj=str(file_path.resolve()),
-                path_in_repo=f"logs/{filename}",
-                repo_id=REPO_ID,
-                repo_type="dataset",
-                token=HF_TOKEN
-            )
-        except Exception as e:
-            print(f"  ! Log upload failed for {filename}: {e}")
+    try:
+        api.upload_folder(
+            folder_path=str(primary_path.resolve()),
+            path_in_repo="logs",
+            repo_id=REPO_ID,
+            repo_type="dataset",
+            token=HF_TOKEN
+        )
+        print("[HF Sync] Logs & MLflow database uploaded successfully!\n")
+    except Exception as e:
+        print(f"[HF Sync] Log upload notice: {e}")
 
-    print("[HF Sync] Log upload completed successfully!\n")
+
+def download_logs(log_dir: str = None):
+    if log_dir is None:
+        log_dir = os.getenv("LOG_DIR", train_cfg.get("log_dir", "metrics"))
+
+    primary_path = _resolve_path(log_dir)
+    primary_path.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n[HF Sync] Downloading latest training logs & MLflow metrics from repo '{REPO_ID}' to {primary_path.resolve()}...")
+    try:
+        snapshot_download(
+            repo_id=REPO_ID,
+            repo_type="dataset",
+            local_dir=str(PROJECT_ROOT),
+            allow_patterns="logs/*",
+            token=HF_TOKEN
+        )
+        # If downloaded into logs/, copy/move to metrics/
+        logs_downloaded = PROJECT_ROOT / "logs"
+        if logs_downloaded.exists() and logs_downloaded.resolve() != primary_path.resolve():
+            for item in logs_downloaded.glob("*"):
+                target = primary_path / item.name
+                if item.is_dir():
+                    shutil.copytree(str(item), str(target), dirs_exist_ok=True)
+                else:
+                    shutil.copy2(str(item), str(target))
+        print("[HF Sync] Logs & MLflow database downloaded successfully!\n")
+    except Exception as e:
+        print(f"[HF Sync] Log download notice: {e}")
 
 
 def upload_dataset(data_dir: str = None, zip_first: bool = True):
@@ -381,6 +389,7 @@ def main():
     parser.add_argument("--upload-checkpoints", action="store_true", help="Upload local model checkpoints to HF Storage Bucket")
     parser.add_argument("--download-checkpoints", action="store_true", help="Download remote model checkpoints from HF Storage Bucket")
     parser.add_argument("--upload-logs", action="store_true", help="Upload training/evaluation metrics logs to HF Storage Bucket")
+    parser.add_argument("--download-logs", action="store_true", help="Download training/evaluation metrics logs & MLflow DB from HF Storage Bucket")
     parser.add_argument("--upload-dataset", action="store_true", help="Upload dataset directory to HF Storage Bucket")
     parser.add_argument("--download-dataset", action="store_true", help="Download raw dataset directory from HF Storage Bucket")
     parser.add_argument("--data-dir", type=str, default=env_data_dir, help="Path to data directory for upload")
@@ -390,7 +399,7 @@ def main():
 
     args = parser.parse_args()
 
-    if not any([args.upload_checkpoints, args.download_checkpoints, args.upload_logs, args.upload_dataset, args.download_dataset, args.sync_all]):
+    if not any([args.upload_checkpoints, args.download_checkpoints, args.upload_logs, args.download_logs, args.upload_dataset, args.download_dataset, args.sync_all]):
         parser.print_help()
         return
 
@@ -399,6 +408,9 @@ def main():
 
     if args.sync_all or args.upload_logs:
         upload_logs(args.log_dir)
+
+    if args.download_logs:
+        download_logs(args.log_dir)
 
     if args.sync_all or args.upload_dataset:
         upload_dataset(args.data_dir)

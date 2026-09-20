@@ -923,6 +923,16 @@ def train_dgnet(
             "val_fnr": epoch_metrics["fnr"],
         }, step=epoch)
 
+        # Periodically upload MLflow database and checkpoints to Hugging Face every 5 epochs
+        if (epoch % 5 == 0 or saved_str or epoch == epochs) and os.getenv("TRAINING_PLATFORM", "huggingface").lower() in ("huggingface", "hf", "true", "1"):
+            try:
+                from scripts.hf_sync import upload_logs, upload_checkpoints
+                upload_logs()
+                if saved_str:
+                    upload_checkpoints()
+            except Exception as sync_err:
+                pass
+
         # Early stopping check
         if epochs_without_improvement >= early_stop_patience:
             print(f"\n[Early Stopping] No improvement in val loss for {early_stop_patience} epochs. Stopping training.")
