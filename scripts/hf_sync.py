@@ -235,37 +235,43 @@ def upload_logs(log_dir: str = None):
         PROJECT_ROOT / "logs",
     ]
 
+    files_to_upload = {}
     for cp in candidate_paths:
         try:
-            if cp.exists() and cp.is_dir() and cp.resolve() != primary_path.resolve():
+            if cp.exists() and cp.is_dir():
                 for item in cp.rglob("*"):
                     if item.is_file() and not item.name.startswith("."):
-                        rel = item.relative_to(cp)
-                        target = primary_path / rel
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        if not target.exists() or item.stat().st_mtime > target.stat().st_mtime:
-                            shutil.copy2(str(item), str(target))
+                        rel = str(item.relative_to(cp)).replace("\\", "/")
+                        files_to_upload[rel] = item
         except Exception:
             pass
 
-    print(f"\n[HF Sync] Uploading training logs & MLflow metrics folder from {primary_path.resolve()} to '{REPO_ID}' (path_in_repo='metrics')...")
+    if not files_to_upload:
+        print(f"[HF Sync] Log directory does not contain files to upload.")
+        return
+
+    print(f"\n[HF Sync] Uploading {len(files_to_upload)} log & MLflow file(s) from {primary_path.resolve()} to '{REPO_ID}' (metrics/)...")
     api = get_api()
     try:
         api.create_repo(repo_id=REPO_ID, repo_type="dataset", exist_ok=True, token=HF_TOKEN)
     except Exception as e:
         print(f"[HF Sync] Repository creation note: {e}")
 
-    try:
-        api.upload_folder(
-            folder_path=str(primary_path.resolve()),
-            path_in_repo="metrics",
-            repo_id=REPO_ID,
-            repo_type="dataset",
-            token=HF_TOKEN
-        )
-        print("[HF Sync] Logs & MLflow database uploaded successfully!\n")
-    except Exception as e:
-        print(f"[HF Sync] Log upload notice: {e}")
+    for rel_path, file_path in files_to_upload.items():
+        try:
+            size_mb = file_path.stat().st_size / (1024 * 1024)
+            print(f"  • Uploading metrics/{rel_path} ({size_mb:.2f} MB)...")
+            api.upload_file(
+                path_or_fileobj=str(file_path.resolve()),
+                path_in_repo=f"metrics/{rel_path}",
+                repo_id=REPO_ID,
+                repo_type="dataset",
+                token=HF_TOKEN
+            )
+        except Exception as e:
+            print(f"  ! Log upload failed for {rel_path}: {e}")
+
+    print("[HF Sync] Logs & MLflow database upload completed successfully!\n")
 
 
 def download_logs(log_dir: str = None):
