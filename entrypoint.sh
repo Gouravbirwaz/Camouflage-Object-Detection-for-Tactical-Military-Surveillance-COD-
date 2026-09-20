@@ -86,7 +86,7 @@ python3 scripts/hf_sync.py --download-checkpoints --ckpt-dir "$CKPT_DIR_RESOLVED
 # 2. Run DGNet Preprocessing & Training
 echo ""
 echo "[Step 2/3] Preparing GT masks & launching DGNet TensorFlow GPU Training..."
-echo "[Step 2/3] GT PNG conversion & DGNet GPU Training in progress (Epochs: ${EPOCHS:-200}, Batch Size: ${BATCH_SIZE:-8}, Version: ${MODEL_VERSION:-v2.0_official_dgnet})..." > /tmp/training_status.txt
+echo "[Step 2/3] GT PNG conversion & DGNet GPU Training in progress (Epochs: ${EPOCHS:-10}, Batch Size: ${BATCH_SIZE:-8}, Version: ${MODEL_VERSION:-v2.0_official_dgnet})..." > /tmp/training_status.txt
 
 # Convert training GT masks from JPEG to lossless PNG if needed
 echo "[GT Prep] Running GT mask conversion (JPEG to PNG)..."
