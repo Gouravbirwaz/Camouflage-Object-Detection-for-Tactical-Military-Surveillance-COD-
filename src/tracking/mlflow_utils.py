@@ -105,12 +105,28 @@ class MLflowTracker:
 
         if not MLFLOW_AVAILABLE:
             print("[MLflow] Notice: 'mlflow' package is not installed. Tracking disabled.")
-        elif not self.enabled or not self.tracking_uri:
-            print("[MLflow] Notice: MLFLOW_TRACKING_URI not set. Running in offline/no-op mode.")
-            self.enabled = False
-        else:
-            # Fast probe to prevent 10+ minute freeze if remote tracking host is offline/unreachable
-            if self.tracking_uri.startswith(("http://", "https://")):
+        # Determine resolved metrics directory for direct SQLite storage
+        log_dir_env = os.getenv("LOG_DIR", "metrics")
+        resolved_log_dir = _resolve_path(log_dir_env)
+        for cand in [Path("/data/metrics"), Path("/app/metrics"), PROJECT_ROOT / "metrics"]:
+            if cand.exists() and cand.is_dir():
+                resolved_log_dir = cand
+                break
+        resolved_log_dir.mkdir(parents=True, exist_ok=True)
+        db_dir = resolved_log_dir / "mlflow_db"
+        db_dir.mkdir(parents=True, exist_ok=True)
+        db_file = db_dir / "mlflow.db"
+        
+        # Absolute SQLite URI with 4 slashes for Linux/Windows compatibility
+        clean_db_str = str(db_file.resolve()).replace("\\", "/")
+        if not clean_db_str.startswith("/"):
+            clean_db_str = "/" + clean_db_str
+        direct_sqlite_uri = f"sqlite:///{clean_db_str}"
+
+        # Probe remote HTTP tracking URI if specified
+        is_remote_http = False
+        if self.tracking_uri and self.tracking_uri.startswith(("http://", "https://")):
+            if not any(lh in self.tracking_uri for lh in ("127.0.0.1", "localhost", "0.0.0.0")):
                 import socket
                 from urllib.parse import urlparse
                 parsed = urlparse(self.tracking_uri)
@@ -119,43 +135,38 @@ class MLflowTracker:
                 try:
                     sock = socket.create_connection((host, port), timeout=2.0)
                     sock.close()
+                    is_remote_http = True
                 except Exception as conn_err:
-                    print(f"[MLflow] Notice: Remote tracking server at {self.tracking_uri} is unreachable ({conn_err}).")
-                    if self.tracking_uri != "http://127.0.0.1:5000":
-                        print("[MLflow] Falling back to embedded local MLflow server at http://127.0.0.1:5000...")
-                        self.tracking_uri = "http://127.0.0.1:5000"
-                        try:
-                            sock = socket.create_connection(("127.0.0.1", 5000), timeout=2.0)
-                            sock.close()
-                            self.enabled = True
-                        except Exception:
-                            print("[MLflow] Embedded server not reachable. Disabling MLflow tracking.")
-                            self.enabled = False
-                    else:
-                        self.enabled = False
+                    print(f"[MLflow] Notice: Remote server at {self.tracking_uri} unreachable ({conn_err}).")
+                    print(f"[MLflow] Routing tracking directly to SQLite database file: {db_file}")
 
-            if self.enabled:
+        if not is_remote_http:
+            self.tracking_uri = direct_sqlite_uri
+
+        self.enabled = MLFLOW_AVAILABLE
+
+        if not MLFLOW_AVAILABLE:
+            print("[MLflow] Notice: 'mlflow' package is not installed. Tracking disabled.")
+        elif self.enabled:
+            try:
+                mlflow.set_tracking_uri(self.tracking_uri)
+                # Create experiment with explicit S3 artifact location if not already existing
                 try:
-                    mlflow.set_tracking_uri(self.tracking_uri)
-                    # Create experiment with explicit S3 artifact location if not already existing
-                    try:
-                        client = MlflowClient(tracking_uri=self.tracking_uri)
-                        exp = client.get_experiment_by_name(self.experiment_name)
-                        if exp is None:
-                            client.create_experiment(
-                                name=self.experiment_name,
-                                artifact_location=self.artifact_location
-                            )
-                            print(f"[MLflow] Created experiment '{self.experiment_name}' with S3 artifact root: {self.artifact_location}")
-                    except Exception:
-                        pass
+                    client = MlflowClient(tracking_uri=self.tracking_uri)
+                    exp = client.get_experiment_by_name(self.experiment_name)
+                    if exp is None:
+                        client.create_experiment(
+                            name=self.experiment_name,
+                            artifact_location=self.artifact_location
+                        )
+                        print(f"[MLflow] Created experiment '{self.experiment_name}' at {self.tracking_uri}")
+                except Exception:
+                    pass
 
-                    mlflow.set_experiment(self.experiment_name)
-                    print(f"[MLflow] Initialized tracking at: {self.tracking_uri} | Experiment: '{self.experiment_name}'")
-                    print(f"[MLflow] S3 Artifact Store: {self.artifact_location} (Endpoint: {s3_endpoint})")
-                except Exception as e:
-                    print(f"[MLflow] Warning: Failed to connect to tracking URI ({e}). Falling back to no-op mode.")
-                    self.enabled = False
+                mlflow.set_experiment(self.experiment_name)
+                print(f"[MLflow] Initialized direct tracking at: {self.tracking_uri} | Experiment: '{self.experiment_name}'")
+            except Exception as e:
+                print(f"[MLflow] Warning: Failed to set tracking URI ({e}).")
 
     def start_run(
         self,
