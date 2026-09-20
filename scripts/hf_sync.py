@@ -84,10 +84,14 @@ def upload_checkpoints(ckpt_dir: str = None):
     candidate_paths = [
         primary_path,
         Path("/data/models/raw_checkpoints"),
+        Path("/data/models/quantized"),
+        Path("/data/models"),
         Path("/app/models/raw_checkpoints"),
+        Path("/app/models/quantized"),
         PROJECT_ROOT / "models/raw_checkpoints",
+        PROJECT_ROOT / "models/quantized",
+        PROJECT_ROOT / "models",
     ]
-
 
     # Collect unique candidate paths that exist
     existing_dirs = []
@@ -115,10 +119,12 @@ def upload_checkpoints(ckpt_dir: str = None):
 
     for dir_path in existing_dirs:
         try:
-            for file in dir_path.glob("*"):
+            for file in dir_path.rglob("*"):
                 if file.is_file() and not file.name.startswith("."):
                     if file.suffix.lower() in valid_exts or "weights" in file.name or "dgnet" in file.name:
-                        files_to_upload[file.name] = file
+                        # Determine path in repo based on subfolder (quantized vs raw_checkpoints)
+                        subfolder = "quantized" if "quantized" in str(file.parent).lower() else "raw_checkpoints"
+                        files_to_upload[f"{subfolder}/{file.name}"] = (file, subfolder)
         except Exception:
             continue
 
@@ -135,20 +141,21 @@ def upload_checkpoints(ckpt_dir: str = None):
         print(" 2. Under 'Space Secrets', add key: HF_TOKEN value: <your_hf_write_token>")
         print("!" * 70 + "\n")
 
-    print(f"\n[HF Sync] Uploading {len(files_to_upload)} checkpoint(s) to repo '{REPO_ID}' (path_in_repo='models/raw_checkpoints')...")
+    print(f"\n[HF Sync] Uploading {len(files_to_upload)} model & checkpoint file(s) to repo '{REPO_ID}' (models/)...")
     api = get_api()
     try:
         api.create_repo(repo_id=REPO_ID, repo_type="dataset", exist_ok=True, token=HF_TOKEN)
     except Exception as e:
         print(f"[HF Sync] Repository creation note: {e}")
 
-    for filename, file_path in files_to_upload.items():
+    for repo_key, (file_path, subfolder) in files_to_upload.items():
         try:
+            filename = file_path.name
             size_mb = file_path.stat().st_size / (1024 * 1024)
-            print(f"  • Uploading {filename} ({size_mb:.2f} MB) from {file_path.parent}...")
+            print(f"  • Uploading models/{subfolder}/{filename} ({size_mb:.2f} MB)...")
             api.upload_file(
                 path_or_fileobj=str(file_path.resolve()),
-                path_in_repo=f"models/raw_checkpoints/{filename}",
+                path_in_repo=f"models/{subfolder}/{filename}",
                 repo_id=REPO_ID,
                 repo_type="dataset",
                 token=HF_TOKEN
@@ -160,7 +167,7 @@ def upload_checkpoints(ckpt_dir: str = None):
                 if not dest.exists():
                     shutil.copy2(str(file_path), str(dest))
         except Exception as e:
-            print(f"  ! Upload failed for {filename}: {e}")
+            print(f"  ! Upload failed for {repo_key}: {e}")
 
     print("[HF Sync] Checkpoint upload completed successfully!\n")
 

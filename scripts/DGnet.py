@@ -1219,6 +1219,18 @@ def export_tflite(
     with open(output_file, "wb") as f:
         f.write(tflite_model)
 
+    # Ensure copies are stored in both quantized and raw_checkpoints folders for automatic HF S3 sync
+    for candidate_dir in [PROJECT_ROOT / "models/raw_checkpoints", PROJECT_ROOT / "models/quantized", Path("/data/models/quantized"), Path("/data/models/raw_checkpoints")]:
+        try:
+            if candidate_dir.exists() or candidate_dir.parent.exists():
+                candidate_dir.mkdir(parents=True, exist_ok=True)
+                target_tflite = candidate_dir / output_file.name
+                if target_tflite.resolve() != output_file.resolve():
+                    with open(target_tflite, "wb") as f:
+                        f.write(tflite_model)
+        except Exception:
+            pass
+
     print(f"[Export] SUCCESS: TFLite model successfully saved ({output_file.stat().st_size / (1024*1024):.2f} MB).\n")
 
 
