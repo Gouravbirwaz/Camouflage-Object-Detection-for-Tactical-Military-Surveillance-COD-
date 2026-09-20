@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-DGNet Single Image Testing Script
-Loads a trained DGNet checkpoint, runs inference on a sample RGB image,
-and saves the predicted camouflage mask + a side-by-side comparison.
+DGNet Multi-Model Inference & Visual Camouflage Detection Test Suite
+Loads trained model checkpoints/formats (Keras weights, TFLite, ONNX), runs inference on sample RGB images,
+and saves predicted camouflage masks, color heatmaps, contour overlays, side-by-side multi-model comparisons,
+and an interactive HTML visual report.
 
 Usage:
     python tests/test_model_inference.py
-    python tests/test_model_inference.py --image data/raw/dataset-splitM/Testing/Images/image501.jpg
-    python tests/test_model_inference.py --image path/to/any/image.jpg --checkpoint models/raw_checkpoints/dgnet_best.weights.h5
-    python tests/test_model_inference.py --threshold 0.4 --output-dir tests/output
+    python tests/test_model_inference.py --all-models
+    python tests/test_model_inference.py --image data/raw/dataset-splitM/Testing/Images/image515.jpg --all-models
+    python tests/test_model_inference.py --threshold 0.35 --output-dir tests/unit/output
 """
 
 import argparse
+import html
 import os
 import sys
 import time
@@ -19,6 +21,13 @@ from pathlib import Path
 
 import numpy as np
 import tensorflow as tf
+
+# Try importing cv2 for color heatmap and contour rendering
+try:
+    import cv2
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -32,11 +41,11 @@ from src.utils.metrics import compute_all_metrics
 
 def load_and_preprocess_image(image_path: str, image_size: tuple = (384, 384)) -> tuple:
     """
-    Loads an RGB image, resizes it, and normalizes to [0, 1].
+    Loads an RGB image, resizes it, and normalizes to ImageNet stats.
 
     Returns:
         (input_tensor, original_image)
-        - input_tensor: [1, H, W, 3] float32 tensor normalized to [0, 1]
+        - input_tensor: [1, H, W, 3] float32 tensor
         - original_image: original-resolution uint8 numpy array for visualization
     """
     raw_bytes = tf.io.read_file(image_path)
@@ -63,35 +72,139 @@ def load_ground_truth(gt_path: str, image_size: tuple = (384, 384)):
     return mask
 
 
+def process_prediction_mask(
+    pred_prob: np.ndarray,
+    threshold: float = 0.5,
+    sharpen: bool = True,
+    adaptive_threshold: bool = True,
+    auto_invert: bool = False
+) -> tuple:
+    """
+    Processes raw prediction probability array into a scaled probability map and binary mask.
+
+    Returns:
+        (scaled_prob, binary_mask)
+    """
+    is_3d = (pred_prob.ndim == 3)
+    pred_prob_2d = pred_prob[:, :, 0] if is_3d else pred_prob
+
+    p_min, p_max = float(pred_prob_2d.min()), float(pred_prob_2d.max())
+
+    # Sharpening via Min-Max Scaling to full dynamic range [0, 1]
+    if sharpen and (p_max - p_min) > 1e-4:
+        scaled_prob_2d = (pred_prob_2d - p_min) / (p_max - p_min)
+    else:
+        scaled_prob_2d = pred_prob_2d.copy()
+
+    # Inversion handling if background is bright
+    initial_cov = np.mean(scaled_prob_2d >= threshold)
+    if auto_invert and initial_cov > 0.5:
+        scaled_prob_2d = 1.0 - scaled_prob_2d
+
+    # Adaptive or fixed thresholding
+    if adaptive_threshold and p_max < threshold and (p_max - p_min) > 1e-4:
+        effective_thresh = 0.5
+    else:
+        effective_thresh = threshold
+
+    binary_mask_2d = (scaled_prob_2d >= effective_thresh).astype(np.float32)
+
+    if is_3d:
+        scaled_prob = scaled_prob_2d[:, :, np.newaxis]
+        binary_mask = binary_mask_2d[:, :, np.newaxis]
+    else:
+        scaled_prob = scaled_prob_2d
+        binary_mask = binary_mask_2d
+
+    return scaled_prob, binary_mask
+
+
 def save_mask_png(mask_array: np.ndarray, output_path: str):
     """Saves a [H, W] or [H, W, 1] float mask as a grayscale PNG (0-255)."""
     if mask_array.ndim == 3:
         mask_array = mask_array[:, :, 0]
-    mask_uint8 = (mask_array * 255).astype(np.uint8)
+    mask_uint8 = (np.clip(mask_array, 0.0, 1.0) * 255).astype(np.uint8)
     encoded = tf.image.encode_png(tf.expand_dims(mask_uint8, -1))
     tf.io.write_file(output_path, encoded)
 
 
+def save_color_heatmap_png(prob_array: np.ndarray, output_path: str, sharpen: bool = True):
+    """
+    Renders probability prediction array into a vibrant color heatmap (JET colormap)
+    to visually highlight soft camouflage confidence regions.
+    """
+    if prob_array.ndim == 3:
+        prob_array = prob_array[:, :, 0]
+
+    p_min, p_max = float(prob_array.min()), float(prob_array.max())
+    if sharpen and (p_max - p_min) > 1e-4:
+        prob_scaled = (prob_array - p_min) / (p_max - p_min)
+    else:
+        prob_scaled = prob_array
+
+    prob_clipped = np.clip(prob_scaled, 0.0, 1.0)
+    prob_uint8 = (prob_clipped * 255).astype(np.uint8)
+
+    if HAS_CV2:
+        heatmap_bgr = cv2.applyColorMap(prob_uint8, cv2.COLORMAP_JET)
+        heatmap_rgb = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
+    else:
+        # Fallback RGB pseudo-color
+        r = prob_uint8
+        g = (np.sin(prob_clipped * np.pi) * 255).astype(np.uint8)
+        b = (255 - prob_uint8)
+        heatmap_rgb = np.stack([r, g, b], axis=-1)
+
+    encoded = tf.image.encode_png(heatmap_rgb)
+    tf.io.write_file(output_path, encoded)
+
+
+def save_contour_overlay_image(original: np.ndarray, pred_mask: np.ndarray, output_path: str,
+                              image_size: tuple = (384, 384)):
+    """
+    Overlays vibrant camouflage detection boundary contours (neon green/red) on the RGB image.
+    """
+    orig_resized = tf.image.resize(original, image_size).numpy().astype(np.uint8)
+    if pred_mask.ndim == 3:
+        pred_mask = pred_mask[:, :, 0]
+
+    mask_bool = pred_mask > 0.5
+    overlay = orig_resized.copy()
+
+    if HAS_CV2:
+        mask_uint8 = (mask_bool * 255).astype(np.uint8)
+        contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Draw semi-transparent fill
+        fill = overlay.copy()
+        fill[mask_bool] = (fill[mask_bool] * 0.6 + np.array([0, 225, 120]) * 0.4).astype(np.uint8)
+        cv2.drawContours(fill, contours, -1, (255, 30, 30), 2)  # Red outline
+        overlay = fill
+    else:
+        overlay[mask_bool, 0] = np.clip(overlay[mask_bool, 0] * 0.5 + 128, 0, 255)
+
+    encoded = tf.image.encode_png(overlay)
+    tf.io.write_file(output_path, encoded)
+
+
 def save_comparison_image(original: np.ndarray, pred_mask: np.ndarray, output_path: str,
-                          gt_mask: np.ndarray = None, image_size: tuple = (384, 384)):
+                          gt_mask: np.ndarray = None, image_size: tuple = (384, 384),
+                          prob_mask: np.ndarray = None):
     """
     Creates and saves a side-by-side comparison image:
-    [Original | Predicted Mask | Overlay] or [Original | GT Mask | Predicted Mask | Overlay] if GT exists.
+    [Original | GT Mask (if present) | Binary Mask | Heatmap | Overlay]
     """
-    # Resize original to match mask size
     orig_resized = tf.image.resize(original, image_size).numpy().astype(np.uint8)
 
-    # Predicted mask as 3-channel
     if pred_mask.ndim == 2:
         pred_mask = pred_mask[:, :, np.newaxis]
     pred_vis = np.repeat((pred_mask * 255).astype(np.uint8), 3, axis=-1)
 
-    # Overlay: red tint on predicted regions
+    # Overlay
     overlay = orig_resized.copy().astype(np.float32)
     mask_bool = pred_mask[:, :, 0] > 0.5
-    overlay[mask_bool, 0] = np.clip(overlay[mask_bool, 0] * 0.5 + 128, 0, 255)  # Red channel boost
-    overlay[mask_bool, 1] = overlay[mask_bool, 1] * 0.5  # Dim green
-    overlay[mask_bool, 2] = overlay[mask_bool, 2] * 0.5  # Dim blue
+    overlay[mask_bool, 0] = np.clip(overlay[mask_bool, 0] * 0.4 + 150, 0, 255)  # Red tint
+    overlay[mask_bool, 1] = overlay[mask_bool, 1] * 0.6
+    overlay[mask_bool, 2] = overlay[mask_bool, 2] * 0.6
     overlay = overlay.astype(np.uint8)
 
     panels = [orig_resized]
@@ -102,47 +215,82 @@ def save_comparison_image(original: np.ndarray, pred_mask: np.ndarray, output_pa
         gt_vis = np.repeat((gt_mask * 255).astype(np.uint8), 3, axis=-1)
         panels.append(gt_vis)
 
-    panels.extend([pred_vis, overlay])
+    panels.append(pred_vis)
+
+    if prob_mask is not None:
+        if prob_mask.ndim == 3:
+            prob_mask = prob_mask[:, :, 0]
+        prob_u8 = (np.clip(prob_mask, 0.0, 1.0) * 255).astype(np.uint8)
+        if HAS_CV2:
+            hm_bgr = cv2.applyColorMap(prob_u8, cv2.COLORMAP_JET)
+            hm_rgb = cv2.cvtColor(hm_bgr, cv2.COLOR_BGR2RGB)
+        else:
+            hm_rgb = np.stack([prob_u8, prob_u8, 255 - prob_u8], axis=-1)
+        panels.append(hm_rgb)
+
+    panels.append(overlay)
 
     comparison = np.concatenate(panels, axis=1)
     encoded = tf.image.encode_png(comparison)
     tf.io.write_file(output_path, encoded)
 
 
-def find_default_sample_image() -> str:
-    """Finds a sample test image from the dataset."""
+def save_multi_model_comparison(original: np.ndarray, gt_mask: np.ndarray,
+                                model_results: list, output_path: str,
+                                image_size: tuple = (384, 384)):
+    """
+    Creates a consolidated side-by-side comparison grid placing output masks of ALL models together:
+    [Original RGB | Ground Truth | Model 1 Mask | Model 2 Mask | ... | Best Heatmap]
+    """
+    orig_resized = tf.image.resize(original, image_size).numpy().astype(np.uint8)
+    panels = [orig_resized]
+
+    if gt_mask is not None:
+        gt_np = gt_mask.numpy() if hasattr(gt_mask, "numpy") else gt_mask
+        if gt_np.ndim == 2:
+            gt_np = gt_np[:, :, np.newaxis]
+        gt_vis = np.repeat((gt_np * 255).astype(np.uint8), 3, axis=-1)
+        panels.append(gt_vis)
+
+    for res in model_results:
+        p_mask = res["binary_mask"]
+        if p_mask.ndim == 2:
+            p_mask = p_mask[:, :, np.newaxis]
+        m_vis = np.repeat((p_mask * 255).astype(np.uint8), 3, axis=-1)
+        panels.append(m_vis)
+
+    comparison = np.concatenate(panels, axis=1)
+    encoded = tf.image.encode_png(comparison)
+    tf.io.write_file(output_path, encoded)
+
+
+def find_default_sample_images() -> list:
+    """Finds candidate test images from the dataset."""
     candidates = [
+        # PROJECT_ROOT / "data/raw/dataset-splitM/Testing/Images/image515.jpg",
+        PROJECT_ROOT / "data/raw/dataset-splitM/Testing/Images/image519.jpg",
         PROJECT_ROOT / "data/raw/dataset-splitM/Testing/Images/image501.jpg",
         PROJECT_ROOT / "data/raw/dataset-splitM/Testing/Images/image1000.jpg",
     ]
-    # Try specific files first
-    for c in candidates:
-        if c.exists():
-            return str(c)
+    found = [str(c) for c in candidates if c.exists()]
+    if found:
+        return found
 
-    # Scan for any image in Testing/Images
     test_img_dir = PROJECT_ROOT / "data/raw/dataset-splitM/Testing/Images"
     if test_img_dir.exists():
         for f in sorted(test_img_dir.glob("*")):
             if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}:
-                return str(f)
-
-    # Scan Training/Images as fallback
-    train_img_dir = PROJECT_ROOT / "data/raw/dataset-splitM/Training/Images"
-    if train_img_dir.exists():
-        for f in sorted(train_img_dir.glob("*")):
-            if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}:
-                return str(f)
-
-    return None
+                found.append(str(f))
+                if len(found) >= 5:
+                    break
+    return found
 
 
 def find_ground_truth_for_image(image_path: str) -> str:
-    """Attempts to find the matching ground truth mask for a given image."""
+    """Attempts to find matching ground truth mask for an image."""
     img_path = Path(image_path)
     stem = img_path.stem
 
-    # Check sibling GT folder
     gt_candidates = [
         img_path.parent.parent / "GT" / f"{stem}.png",
         img_path.parent.parent / "Masks" / f"{stem}.png",
@@ -154,174 +302,396 @@ def find_ground_truth_for_image(image_path: str) -> str:
     return None
 
 
-def find_best_checkpoint() -> str:
-    """Finds the best available model checkpoint."""
-    candidates = [
-        # PROJECT_ROOT / "models/raw_checkpoints/dgnet_best.weights.h5",
-        PROJECT_ROOT / "models/raw_checkpoints/dgnet_v1.0_latest.weights.h5"
-    ]
-    for c in candidates:
-        if c.exists() and c.stat().st_size > 0:
-            return str(c)
+def discover_all_models(models_dir: Path = None) -> list:
+    """
+    Crawls models/ directory to discover all checkpoints and exported models:
+    - .weights.h5 / .keras / .h5 Keras checkpoints
+    - .tflite TFLite models
+    - .onnx ONNX models
+    """
+    target_dir = models_dir or (PROJECT_ROOT / "models")
+    model_entries = []
 
-    # Fallback: any .weights.h5 file
-    ckpt_dir = PROJECT_ROOT / "models/raw_checkpoints"
-    if ckpt_dir.exists():
-        for f in sorted(ckpt_dir.glob("*.weights.h5"), reverse=True):
-            if f.stat().st_size > 0:
-                return str(f)
-    return None
+    if not target_dir.exists():
+        return model_entries
+
+    valid_exts = {".weights.h5", ".keras", ".h5", ".tflite", ".onnx"}
+
+    for path in sorted(target_dir.rglob("*")):
+        if path.is_file():
+            suffix = path.suffix.lower()
+            name_lower = path.name.lower()
+            if any(name_lower.endswith(ext) for ext in valid_exts):
+                if path.stat().st_size == 0:
+                    continue
+
+                rel_path = path.relative_to(target_dir)
+                parent_folder = path.parent.name
+                stem = path.stem.replace(".weights", "")
+
+                # Infer backbone from filename or path
+                backbone = "mobilenet_v3_large"
+                if "resnet50" in name_lower:
+                    backbone = "resnet50"
+                elif "efficientnet_b1" in name_lower:
+                    backbone = "efficientnet_b1"
+                elif "efficientnet_b4" in name_lower:
+                    backbone = "efficientnet_b4"
+                elif "efficientnet_b0" in name_lower:
+                    backbone = "efficientnet_b0"
+
+                model_type = "keras"
+                if name_lower.endswith(".tflite"):
+                    model_type = "tflite"
+                elif name_lower.endswith(".onnx"):
+                    model_type = "onnx"
+
+                tag = f"{parent_folder}_{stem}"
+
+                model_entries.append({
+                    "path": str(path.resolve()),
+                    "name": path.name,
+                    "tag": tag,
+                    "rel_path": str(rel_path),
+                    "parent_folder": parent_folder,
+                    "model_type": model_type,
+                    "backbone": backbone,
+                    "size_mb": path.stat().st_size / (1024 * 1024)
+                })
+
+    return model_entries
+
+
+class ModelRunner:
+    """Wrapper to instantiate and run inference across different model formats."""
+
+    def __init__(self, model_info: dict, img_size: tuple = (384, 384)):
+        self.info = model_info
+        self.img_size = img_size
+        self.model_type = model_info["model_type"]
+        self.path = model_info["path"]
+        self.backbone = model_info["backbone"]
+        self.loaded_model = None
+        self._init_model()
+
+    def _init_model(self):
+        if self.model_type == "keras":
+            self.loaded_model = build_dgnet_model(
+                backbone_name=self.backbone,
+                input_shape=(self.img_size[0], self.img_size[1], 3),
+                gradient_kernel="sobel",
+                pretrained=False
+            )
+            dummy = tf.zeros((1, self.img_size[0], self.img_size[1], 3))
+            _ = self.loaded_model(dummy, training=False)
+            try:
+                if self.path.endswith(".keras"):
+                    self.loaded_model = tf.keras.models.load_model(self.path, compile=False)
+                else:
+                    self.loaded_model.load_weights(self.path)
+            except Exception as e:
+                print(f"       Notice: Partial weight load for {self.info['name']} ({e})")
+        elif self.model_type == "tflite":
+            interpreter = tf.lite.Interpreter(model_path=self.path)
+            interpreter.allocate_tensors()
+            self.loaded_model = interpreter
+        elif self.model_type == "onnx":
+            try:
+                import onnxruntime as ort
+                self.loaded_model = ort.InferenceSession(self.path)
+            except ImportError:
+                print(f"       Notice: onnxruntime not installed, skipping ONNX model {self.info['name']}")
+                self.loaded_model = None
+
+    def predict(self, input_tensor: tf.Tensor) -> np.ndarray:
+        """Executes forward pass and returns [H, W, 1] sigmoid numpy array."""
+        if self.model_type == "keras":
+            pred = self.loaded_model(input_tensor, training=False)
+            return pred.numpy()[0]
+        elif self.model_type == "tflite":
+            interpreter = self.loaded_model
+            input_details = interpreter.get_input_details()
+            output_details = interpreter.get_output_details()
+            inp_np = input_tensor.numpy()
+            interpreter.set_tensor(input_details[0]['index'], inp_np)
+            interpreter.invoke()
+            pred = interpreter.get_tensor(output_details[0]['index'])
+            if pred.ndim == 4:
+                pred = pred[0]
+            return pred
+        elif self.model_type == "onnx":
+            if self.loaded_model is None:
+                return np.zeros((self.img_size[0], self.img_size[1], 1), dtype=np.float32)
+            input_name = self.loaded_model.get_inputs()[0].name
+            inp_np = input_tensor.numpy()
+            outputs = self.loaded_model.run(None, {input_name: inp_np})
+            pred = outputs[0]
+            if pred.ndim == 4:
+                pred = pred[0]
+            return pred
+        return np.zeros((self.img_size[0], self.img_size[1], 1), dtype=np.float32)
+
+
+def generate_html_visual_report(image_stem: str, model_results: list, output_dir: Path, gt_path: str = None):
+    """
+    Generates an HTML report visualizing all camouflage detection masks,
+    probability heatmaps, and metrics across all models side-by-side.
+    """
+    report_path = output_dir / f"{image_stem}_visual_report.html"
+
+    cards_html = ""
+    for res in model_results:
+        tag = res["tag"]
+        name = res["name"]
+        folder = res["parent_folder"]
+        metrics = res.get("metrics", {})
+
+        metrics_html = ""
+        if metrics:
+            metrics_html = f"""
+            <div class="metrics-grid">
+                <div class="metric"><span class="lbl">IoU</span><span class="val">{metrics.get('iou', 0):.4f}</span></div>
+                <div class="metric"><span class="lbl">Dice</span><span class="val">{metrics.get('dice', 0):.4f}</span></div>
+                <div class="metric"><span class="lbl">MAE</span><span class="val">{metrics.get('mae', 0):.4f}</span></div>
+                <div class="metric"><span class="lbl">Pixel Acc</span><span class="val">{metrics.get('pixel_accuracy', 0)*100:.1f}%</span></div>
+            </div>
+            """
+
+        cards_html += f"""
+        <div class="model-card">
+            <h3>{html.escape(name)} <span class="badge">{html.escape(folder)}</span></h3>
+            <p class="meta">Backbone: <strong>{html.escape(res['backbone'])}</strong> | Type: <strong>{html.escape(res['model_type'])}</strong> | Inference: <strong>{res['inference_time_ms']:.1f} ms</strong></p>
+            <div class="image-trio">
+                <div>
+                    <img src="{image_stem}_{tag}_pred_mask.png" alt="Binary Mask">
+                    <p class="img-lbl">Binary Mask (Threshold {res['threshold']})</p>
+                </div>
+                <div>
+                    <img src="{image_stem}_{tag}_pred_prob.png" alt="Probability Heatmap">
+                    <p class="img-lbl">Color Probability Heatmap</p>
+                </div>
+                <div>
+                    <img src="{image_stem}_{tag}_contour.png" alt="Contour Overlay">
+                    <p class="img-lbl">Contour Overlay</p>
+                </div>
+            </div>
+            {metrics_html}
+        </div>
+        """
+
+    gt_html = f"<p><strong>Ground Truth:</strong> {html.escape(gt_path)}</p>" if gt_path else "<p><strong>Ground Truth:</strong> Not provided</p>"
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>DGNet Camouflage Detection Visual Model Report - {image_stem}</title>
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 24px; }}
+        h1 {{ color: #38bdf8; font-size: 24px; margin-bottom: 8px; }}
+        h2 {{ color: #94a3b8; font-size: 16px; margin-top: 0; margin-bottom: 24px; font-weight: normal; }}
+        .header-card {{ background: #1e293b; padding: 20px; border-radius: 12px; border: 1px solid #334155; margin-bottom: 24px; }}
+        .multi-grid {{ text-align: center; margin: 24px 0; }}
+        .multi-grid img {{ max-width: 100%; border-radius: 8px; border: 2px solid #38bdf8; shadow: 0 4px 12px rgba(0,0,0,0.5); }}
+        .model-card {{ background: #1e293b; border-radius: 12px; border: 1px solid #334155; padding: 20px; margin-bottom: 24px; }}
+        .model-card h3 {{ margin: 0 0 8px 0; color: #f1f5f9; display: flex; align-items: center; justify-content: space-between; }}
+        .badge {{ background: #0284c7; color: #fff; font-size: 11px; padding: 4px 10px; border-radius: 20px; text-transform: uppercase; }}
+        .meta {{ color: #94a3b8; font-size: 13px; margin: 0 0 16px 0; }}
+        .image-trio {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; margin-bottom: 16px; }}
+        .image-trio img {{ width: 100%; border-radius: 6px; border: 1px solid #475569; background: #020617; }}
+        .img-lbl {{ text-align: center; font-size: 12px; color: #cbd5e1; margin-top: 6px; }}
+        .metrics-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; background: #0f172a; padding: 12px; border-radius: 8px; border: 1px solid #334155; }}
+        .metric {{ text-align: center; }}
+        .lbl {{ display: block; font-size: 11px; color: #94a3b8; text-transform: uppercase; }}
+        .val {{ font-size: 16px; font-weight: bold; color: #38bdf8; }}
+    </style>
+</head>
+<body>
+    <div class="header-card">
+        <h1>Tactical Camouflage Detection Visual Comparison</h1>
+        <h2>Image Stem: <strong>{image_stem}</strong> | Models Evaluated: <strong>{len(model_results)}</strong></h2>
+        {gt_html}
+    </div>
+
+    <div class="multi-grid">
+        <h3 style="color: #cbd5e1;">Multi-Model Side-by-Side Comparison Grid</h3>
+        <p style="color: #94a3b8; font-size: 13px;">[ Original RGB | Ground Truth (if avail) | Models Output Masks ... ]</p>
+        <img src="{image_stem}_all_models_comparison.png" alt="Multi-Model Comparison">
+    </div>
+
+    {cards_html}
+</body>
+</html>
+"""
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+    print(f"  Generated HTML Visual Report: {report_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DGNet Single Image Inference Test")
-    parser.add_argument("--image", type=str, default=None, help="Path to input RGB image (auto-detected if not set)")
-    parser.add_argument("--checkpoint", type=str, default=None, help="Path to model weights (auto-detected if not set)")
-    parser.add_argument("--backbone", type=str, default=None, help="Backbone architecture (auto-detected from config)")
-    parser.add_argument("--kernel", type=str, default=None, help="Gradient kernel type (auto-detected from config)")
-    parser.add_argument("--threshold", type=float, default=0.5, help="Binarization threshold for mask (default: 0.5)")
-    parser.add_argument("--invert", action="store_true", help="Invert predicted mask (1 - pred) so target is white and background is black")
-    parser.add_argument("--auto-invert", action="store_true", default=False, help="Auto-detect and flip if background is detected as target (default: False)")
-    parser.add_argument("--no-auto-invert", dest="auto_invert", action="store_false", help="Disable auto-invert")
-    parser.add_argument("--output-dir", type=str, default=None, help="Output directory for masks (default: tests/output)")
-    parser.add_argument("--no-comparison", action="store_true", help="Skip generating comparison image")
+    parser = argparse.ArgumentParser(description="DGNet Multi-Model Visual Inference Test Suite")
+    parser.add_argument("--image", type=str, default=None, help="Path to input RGB image")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to specific model weights")
+    parser.add_argument("--all-models", action="store_true", help="Auto-discover and test all models in models/ directory")
+    parser.add_argument("--backbone", type=str, default=None, help="Backbone architecture")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Binarization threshold (default: 0.5)")
+    parser.add_argument("--invert", action="store_true", help="Invert predicted mask")
+    parser.add_argument("--auto-invert", action="store_true", default=False, help="Auto-detect reversed polarity")
+    parser.add_argument("--sharpen", action="store_true", default=True, help="Apply Min-Max probability scaling for sharp GT-like binary prediction masks")
+    parser.add_argument("--no-sharpen", dest="sharpen", action="store_false", help="Disable Min-Max probability scaling")
+    parser.add_argument("--adaptive-threshold", action="store_true", default=True, help="Automatically scale threshold to peak prediction dynamic range")
+    parser.add_argument("--no-adaptive-threshold", dest="adaptive_threshold", action="store_false", help="Disable adaptive thresholding")
+    parser.add_argument("--output-dir", type=str, default=None, help="Output directory for masks")
     args = parser.parse_args()
 
-    # ===== Load Config =====
     cfg = load_project_config()
-    model_cfg = cfg.get("model", {})
     data_cfg = cfg.get("data", cfg.get("dataset", {}))
     img_size = tuple(data_cfg.get("image_size", [384, 384]))
-    backbone = args.backbone or model_cfg.get("context_backbone", "mobilenet_v3_large")
-    kernel = args.kernel or model_cfg.get("gradient_kernel", "sobel")
-
-    # ===== Resolve Paths =====
-    image_path = args.image or find_default_sample_image()
-    if image_path is None:
-        print("[ERROR] No input image found. Provide one with --image <path>")
-        sys.exit(1)
-    image_path = str(Path(image_path).resolve()) if not Path(image_path).is_absolute() else image_path
-
-    checkpoint_path = args.checkpoint or find_best_checkpoint()
-    if checkpoint_path is None:
-        print("[ERROR] No model checkpoint found. Provide one with --checkpoint <path>")
-        sys.exit(1)
-
     output_dir = Path(args.output_dir) if args.output_dir else PROJECT_ROOT / "tests" / "unit" / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    image_stem = Path(image_path).stem
+    # Determine images to test
+    sample_images = [args.image] if args.image else find_default_sample_images()
+    if not sample_images:
+        print("[ERROR] No input images found.")
+        sys.exit(1)
+
+    # Discover models
+    if args.checkpoint:
+        ckpt_path = Path(args.checkpoint).resolve()
+        models_to_test = [{
+            "path": str(ckpt_path),
+            "name": ckpt_path.name,
+            "tag": "custom_checkpoint",
+            "parent_folder": ckpt_path.parent.name,
+            "model_type": "keras",
+            "backbone": args.backbone or "mobilenet_v3_large"
+        }]
+    else:
+        discovered = discover_all_models()
+        if args.all_models or len(discovered) > 1:
+            models_to_test = discovered
+        elif discovered:
+            models_to_test = [discovered[0]]
+        else:
+            print("[ERROR] No models discovered in models/ directory.")
+            sys.exit(1)
 
     print("\n" + "=" * 70)
-    print("         DGNet Single Image Inference Test")
+    print("      DGNet Multi-Model Visual Camouflage Inference Test Suite")
     print("=" * 70)
-    print(f"  Input Image:      {image_path}")
-    print(f"  Checkpoint:       {checkpoint_path}")
-    print(f"  Backbone:         {backbone}")
-    print(f"  Gradient Kernel:  {kernel}")
+    print(f"  Target Image(s):  {len(sample_images)} image(s)")
+    print(f"  Models to Test:   {len(models_to_test)} model(s)")
+    for m in models_to_test:
+        print(f"    • [{m['model_type'].upper()}] {m['name']} ({m['parent_folder']})")
     print(f"  Image Size:       {img_size}")
-    print(f"  Threshold:        {args.threshold}")
+    print(f"  Threshold:        {args.threshold} (Adaptive Sharpening: {args.sharpen})")
     print(f"  Output Dir:       {output_dir.resolve()}")
-    print("-" * 70)
+    print("-" * 70 + "\n")
 
-    # ===== Build & Load Model =====
-    print("\n[1/4] Building DGNet model...", flush=True)
-    model = build_dgnet_model(
-        backbone_name=backbone,
-        input_shape=(img_size[0], img_size[1], 3),
-        gradient_kernel=kernel,
-        pretrained=False
-    )
+    for img_path_str in sample_images:
+        img_path = Path(img_path_str).resolve()
+        image_stem = img_path.stem
+        print(f"\n[Processing Image] {img_path.name}...")
 
-    # Initialize weights with dummy forward pass
-    dummy = tf.zeros((1, img_size[0], img_size[1], 3))
-    _ = model(dummy, training=False)
+        input_tensor, original_image = load_and_preprocess_image(str(img_path), image_size=img_size)
+        gt_path = find_ground_truth_for_image(str(img_path))
+        gt_mask = load_ground_truth(gt_path, image_size=img_size) if gt_path else None
 
-    print(f"[2/4] Loading checkpoint: {Path(checkpoint_path).name}...", flush=True)
-    try:
-        model.load_weights(checkpoint_path)
-        print("       Checkpoint loaded successfully!", flush=True)
-    except Exception as e:
-        print(f"       Notice: Could not directly load all weights ({e}).")
-        print("       Ensure the model has been trained with the updated official DGNet architecture:")
-        print("       python scripts/DGnet.py --train --epochs 50 --batch-size 8")
+        model_results = []
 
-    # ===== Load & Preprocess Image =====
-    print(f"[3/4] Loading image: {Path(image_path).name}...", flush=True)
-    input_tensor, original_image = load_and_preprocess_image(image_path, image_size=img_size)
+        for m_idx, m_info in enumerate(models_to_test, 1):
+            print(f"  [{m_idx}/{len(models_to_test)}] Running model: {m_info['name']} ({m_info['parent_folder']})...", flush=True)
 
-    # ===== Run Inference =====
-    print("[4/4] Running inference...", flush=True)
-    start_time = time.perf_counter()
-    pred_prob = model(input_tensor, training=False)  # [1, H, W, 1] sigmoid output
-    inference_time = time.perf_counter() - start_time
+            try:
+                runner = ModelRunner(m_info, img_size=img_size)
+                start_time = time.perf_counter()
+                pred_prob_np = runner.predict(input_tensor)
+                inference_time = (time.perf_counter() - start_time) * 1000.0
 
-    pred_prob_np = pred_prob.numpy()[0]  # [H, W, 1]
+                p_min, p_max = float(pred_prob_np.min()), float(pred_prob_np.max())
 
-    # Inversion handling (manual flag or auto-detection when background > 50%)
-    initial_coverage = np.mean(pred_prob_np >= args.threshold)
-    should_invert = args.invert or (args.auto_invert and initial_coverage > 0.5)
-    if should_invert:
-        reason = "CLI flag --invert" if args.invert else f"Auto-detected reversed polarity (initial coverage {initial_coverage*100:.1f}% > 50%)"
-        print(f"  -> Inversion Applied: {reason}")
-        print("     Flipping mask: Target set to WHITE (1) and Background set to BLACK (0).")
-        pred_prob_np = 1.0 - pred_prob_np
-        pred_prob = 1.0 - pred_prob
+                # Sharpening via Min-Max Scaling to full dynamic range [0, 1]
+                if args.sharpen and (p_max - p_min) > 1e-4:
+                    scaled_prob = (pred_prob_np - p_min) / (p_max - p_min)
+                else:
+                    scaled_prob = pred_prob_np.copy()
 
-    pred_binary = (pred_prob_np >= args.threshold).astype(np.float32)
+                # Inversion handling
+                initial_cov = np.mean(scaled_prob >= args.threshold)
+                if args.invert or (args.auto_invert and initial_cov > 0.5):
+                    scaled_prob = 1.0 - scaled_prob
 
-    # ===== Save Outputs =====
-    # 1. Raw probability mask
-    prob_mask_path = str(output_dir / f"{image_stem}_pred_prob.png")
-    save_mask_png(pred_prob_np, prob_mask_path)
+                # Adaptive or fixed thresholding
+                if args.adaptive_threshold and p_max < args.threshold and (p_max - p_min) > 1e-4:
+                    effective_thresh = 0.5
+                else:
+                    effective_thresh = args.threshold
 
-    # 2. Binary mask
-    binary_mask_path = str(output_dir / f"{image_stem}_pred_mask.png")
-    save_mask_png(pred_binary, binary_mask_path)
+                pred_binary = (scaled_prob >= effective_thresh).astype(np.float32)
 
-    print(f"\n  Saved probability mask:  {prob_mask_path}")
-    print(f"  Saved binary mask:       {binary_mask_path}")
+                tag = m_info["tag"]
 
-    # ===== Metrics Against GT (if available) =====
-    gt_path = find_ground_truth_for_image(image_path)
-    gt_mask = None
-    if gt_path:
-        gt_mask = load_ground_truth(gt_path, image_size=img_size)
-        if gt_mask is not None:
-            gt_mask_np = gt_mask.numpy()
-            metrics = compute_all_metrics(
-                tf.expand_dims(gt_mask, 0),
-                pred_prob,
-                threshold=args.threshold
-            )
-            print(f"\n  Ground Truth Found:      {gt_path}")
-            print("-" * 70)
-            print(f"  Pixel Accuracy:          {metrics['pixel_accuracy']*100:.2f}%")
-            print(f"  IoU:                     {metrics['iou']:.4f}")
-            print(f"  Dice:                    {metrics['dice']:.4f}")
-            print(f"  F-measure:               {metrics['f_measure']:.4f}")
-            print(f"  MAE:                     {metrics['mae']:.4f}")
-            print(f"  Precision:               {metrics['precision']:.4f}")
-            print(f"  Recall:                  {metrics['recall']:.4f}")
-            print(f"  FPR:                     {metrics['fpr']:.4f}")
-            print(f"  FNR:                     {metrics['fnr']:.4f}")
-    else:
-        print(f"\n  Ground Truth:            Not found (skipping metrics)")
+                # Save individual outputs
+                mask_path = output_dir / f"{image_stem}_{tag}_pred_mask.png"
+                prob_path = output_dir / f"{image_stem}_{tag}_pred_prob.png"
+                contour_path = output_dir / f"{image_stem}_{tag}_contour.png"
+                comp_path = output_dir / f"{image_stem}_{tag}_comparison.png"
 
-    # ===== Save Comparison Image =====
-    if not args.no_comparison:
-        comparison_path = str(output_dir / f"{image_stem}_comparison.png")
-        gt_for_vis = gt_mask.numpy() if gt_mask is not None else None
-        save_comparison_image(original_image, pred_binary, comparison_path,
-                              gt_mask=gt_for_vis, image_size=img_size)
-        print(f"  Saved comparison image:  {comparison_path}")
+                save_mask_png(pred_binary, str(mask_path))
+                save_color_heatmap_png(pred_prob_np, str(prob_path))
+                save_contour_overlay_image(original_image, pred_binary, str(contour_path), image_size=img_size)
 
-    # ===== Summary =====
-    pred_coverage = np.mean(pred_binary) * 100
-    print("-" * 70)
-    print(f"  Inference Time:          {inference_time*1000:.1f} ms ({1.0/inference_time:.1f} FPS)")
-    print(f"  Predicted Coverage:      {pred_coverage:.2f}% of pixels detected as camouflaged")
-    print(f"  Prediction Range:        [{pred_prob_np.min():.4f}, {pred_prob_np.max():.4f}]")
+                gt_for_vis = gt_mask.numpy() if gt_mask is not None else None
+                save_comparison_image(original_image, pred_binary, str(comp_path),
+                                      gt_mask=gt_for_vis, image_size=img_size, prob_mask=pred_prob_np)
+
+                # Compute metrics if GT exists
+                metrics = {}
+                if gt_mask is not None:
+                    pred_prob_tensor = tf.convert_to_tensor(pred_prob_np[np.newaxis, ...], dtype=tf.float32)
+                    metrics = compute_all_metrics(tf.expand_dims(gt_mask, 0), pred_prob_tensor, threshold=args.threshold)
+
+                res_dict = {
+                    "info": m_info,
+                    "name": m_info["name"],
+                    "tag": tag,
+                    "parent_folder": m_info["parent_folder"],
+                    "model_type": m_info["model_type"],
+                    "backbone": m_info["backbone"],
+                    "threshold": args.threshold,
+                    "inference_time_ms": inference_time,
+                    "pred_prob": pred_prob_np,
+                    "binary_mask": pred_binary,
+                    "metrics": metrics
+                }
+                model_results.append(res_dict)
+
+                print(f"      -> Inference: {inference_time:.1f}ms | Coverage: {np.mean(pred_binary)*100:.2f}% | Range: [{pred_prob_np.min():.3f}, {pred_prob_np.max():.3f}]")
+
+            except Exception as err:
+                print(f"      [ERROR] Could not evaluate model {m_info['name']}: {err}")
+
+        # Save consolidated multi-model comparison image
+        if model_results:
+            multi_comp_path = output_dir / f"{image_stem}_all_models_comparison.png"
+            save_multi_model_comparison(original_image, gt_mask, model_results, str(multi_comp_path), image_size=img_size)
+            print(f"\n  Saved Multi-Model Comparison Panel: {multi_comp_path}")
+
+            # Also save default fallback filenames for backwards compatibility
+            first_res = model_results[0]
+            save_mask_png(first_res["pred_prob"], str(output_dir / f"{image_stem}_pred_prob.png"))
+            save_mask_png(first_res["binary_mask"], str(output_dir / f"{image_stem}_pred_mask.png"))
+            save_comparison_image(original_image, first_res["binary_mask"], str(output_dir / f"{image_stem}_comparison.png"),
+                                  gt_mask=(gt_mask.numpy() if gt_mask is not None else None), image_size=img_size, prob_mask=first_res["pred_prob"])
+
+            # Generate HTML Visual Report
+            generate_html_visual_report(image_stem, model_results, output_dir, gt_path=gt_path)
+
+    print("\n" + "=" * 70)
+    print("  Visual Camouflage Detection Test Complete!")
+    print(f"  Inspect visual output masks and HTML reports in: {output_dir.resolve()}")
     print("=" * 70 + "\n")
 
 

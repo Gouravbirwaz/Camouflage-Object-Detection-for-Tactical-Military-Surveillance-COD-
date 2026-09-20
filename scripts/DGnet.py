@@ -293,7 +293,7 @@ def compute_object_gradient_np(image_uint8: np.ndarray, mask_uint8: np.ndarray) 
 
 
 def parse_sample(img_path: tf.Tensor, mask_path: tf.Tensor, image_size: Tuple[int, int]) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
-    """Reads, decodes, resizes, normalizes (ImageNet stats), and extracts official Canny object gradient."""
+    """Reads, decodes, resizes float image [0, 1], and extracts official Canny object gradient."""
     img_bytes = tf.io.read_file(img_path)
     image_raw = tf.image.decode_image(img_bytes, channels=3, expand_animations=False)
     image = tf.image.resize(image_raw, image_size)
@@ -310,10 +310,103 @@ def parse_sample(img_path: tf.Tensor, mask_path: tf.Tensor, image_size: Tuple[in
     grad_gt = tf.numpy_function(_py_grad, [image_uint8, tf.cast(mask, tf.uint8)], tf.float32)
     grad_gt.set_shape([image_size[0], image_size[1], 1])
 
-    # Standard ImageNet normalization matching official DGNet
-    image_norm = (tf.cast(image, tf.float32) / 255.0 - IMAGENET_MEAN) / IMAGENET_STD
+    # Return float image in range [0, 1] for augmentation; normalization performed after augmentation
+    image_float = tf.cast(image, tf.float32) / 255.0
 
-    return image_norm, mask_bin, grad_gt
+    return image_float, mask_bin, grad_gt
+
+
+def _random_resized_crop(img, mask, grad_gt, target_size, scale_min=0.5, scale_max=1.0, ratio_min=0.75, ratio_max=1.33):
+    """
+    Random Resized Crop: Crops a random sub-region at random scale/aspect ratio,
+    then resizes back to target_size. Applied identically to image, mask, and gradient GT.
+    Critical augmentation for multi-scale learning on small datasets.
+    """
+    h, w = target_size
+    img_h = tf.shape(img)[0]
+    img_w = tf.shape(img)[1]
+
+    # Random scale factor
+    scale = tf.random.uniform((), minval=scale_min, maxval=scale_max)
+    # Random aspect ratio
+    log_ratio = tf.random.uniform((), minval=tf.math.log(ratio_min), maxval=tf.math.log(ratio_max))
+    aspect = tf.exp(log_ratio)
+
+    crop_h = tf.cast(tf.cast(img_h, tf.float32) * tf.sqrt(scale / aspect), tf.int32)
+    crop_w = tf.cast(tf.cast(img_w, tf.float32) * tf.sqrt(scale * aspect), tf.int32)
+    crop_h = tf.minimum(crop_h, img_h)
+    crop_w = tf.minimum(crop_w, img_w)
+
+    offset_h = tf.random.uniform((), minval=0, maxval=img_h - crop_h + 1, dtype=tf.int32)
+    offset_w = tf.random.uniform((), minval=0, maxval=img_w - crop_w + 1, dtype=tf.int32)
+
+    img = tf.image.crop_to_bounding_box(img, offset_h, offset_w, crop_h, crop_w)
+    mask = tf.image.crop_to_bounding_box(mask, offset_h, offset_w, crop_h, crop_w)
+    grad_gt = tf.image.crop_to_bounding_box(grad_gt, offset_h, offset_w, crop_h, crop_w)
+
+    img = tf.image.resize(img, [h, w])
+    mask = tf.image.resize(mask, [h, w], method="nearest")
+    grad_gt = tf.image.resize(grad_gt, [h, w], method="nearest")
+
+    return img, mask, grad_gt
+
+
+def _gaussian_blur_tf(img, sigma_min=0.1, sigma_max=2.0, kernel_size=7):
+    """
+    Random Gaussian blur applied only to the image (not mask).
+    Teaches model to handle blurred/unfocused edges common in real tactical imagery.
+    """
+    sigma = tf.random.uniform((), minval=sigma_min, maxval=sigma_max)
+    # Build 1D Gaussian kernel
+    half = kernel_size // 2
+    x = tf.cast(tf.range(-half, half + 1), tf.float32)
+    kernel_1d = tf.exp(-0.5 * (x / sigma) ** 2)
+    kernel_1d = kernel_1d / tf.reduce_sum(kernel_1d)
+    # Separable 2D convolution for efficiency
+    kernel_h = tf.reshape(kernel_1d, [kernel_size, 1, 1, 1])
+    kernel_w = tf.reshape(kernel_1d, [1, kernel_size, 1, 1])
+    # Apply per-channel
+    channels = tf.split(img, 3, axis=-1)
+    blurred = []
+    for ch in channels:
+        ch = tf.expand_dims(ch, 0)  # [1, H, W, 1]
+        ch = tf.nn.conv2d(ch, kernel_h, strides=[1, 1, 1, 1], padding="SAME")
+        ch = tf.nn.conv2d(ch, kernel_w, strides=[1, 1, 1, 1], padding="SAME")
+        blurred.append(ch[0])
+    return tf.concat(blurred, axis=-1)
+
+
+def _cutout_tf(img, max_fraction=0.25):
+    """
+    CutOut / Random Erasing: Zeros out a random rectangular patch (up to 25% of area).
+    Prevents model from relying on single-region cues and reduces overfitting.
+    Applied only to image, not mask or gradient GT.
+    """
+    h = tf.shape(img)[0]
+    w = tf.shape(img)[1]
+    cut_h = tf.cast(tf.cast(h, tf.float32) * tf.random.uniform((), 0.05, max_fraction), tf.int32)
+    cut_w = tf.cast(tf.cast(w, tf.float32) * tf.random.uniform((), 0.05, max_fraction), tf.int32)
+    cy = tf.random.uniform((), minval=0, maxval=h, dtype=tf.int32)
+    cx = tf.random.uniform((), minval=0, maxval=w, dtype=tf.int32)
+
+    y1 = tf.maximum(cy - cut_h // 2, 0)
+    y2 = tf.minimum(cy + cut_h // 2, h)
+    x1 = tf.maximum(cx - cut_w // 2, 0)
+    x2 = tf.minimum(cx + cut_w // 2, w)
+
+    # Create a mask with zeros in the cutout region
+    rows = tf.range(h)
+    cols = tf.range(w)
+    row_mask = tf.logical_or(rows < y1, rows >= y2)
+    col_mask = tf.logical_or(cols < x1, cols >= x2)
+    keep_mask = tf.logical_or(
+        tf.expand_dims(row_mask, 1),
+        tf.expand_dims(col_mask, 0)
+    )
+    keep_mask = tf.cast(keep_mask, tf.float32)
+    keep_mask = tf.expand_dims(keep_mask, -1)  # [H, W, 1]
+
+    return img * keep_mask
 
 
 def create_tf_dataset(
@@ -323,7 +416,7 @@ def create_tf_dataset(
     batch_size: int = 8,
     is_train: bool = True
 ) -> tf.data.Dataset:
-    """Builds a high-throughput TensorFlow tf.data.Dataset pipeline with RAM caching."""
+    """Builds a high-throughput TensorFlow tf.data.Dataset pipeline with RAM caching and aggressive augmentation."""
     dataset = tf.data.Dataset.from_tensor_slices((image_paths, mask_paths))
 
     def _map_fn(img_p, mask_p):
@@ -336,38 +429,67 @@ def create_tf_dataset(
         dataset = dataset.shuffle(buffer_size=min(len(image_paths), 1000), seed=42)
 
         def _augment_fn(img, mask, grad_gt):
-            # Random horizontal flip
+            # --- Geometric Augmentations (applied to image + mask + grad_gt together) ---
+
+            # 1. Random Resized Crop (50% probability): Forces multi-scale learning
+            if tf.random.uniform(()) > 0.5:
+                img, mask, grad_gt = _random_resized_crop(img, mask, grad_gt, image_size, scale_min=0.5, scale_max=1.0)
+
+            # 2. Random horizontal flip
             if tf.random.uniform(()) > 0.5:
                 img = tf.image.flip_left_right(img)
                 mask = tf.image.flip_left_right(mask)
                 grad_gt = tf.image.flip_left_right(grad_gt)
-            # Random vertical flip
+            # 3. Random vertical flip
             if tf.random.uniform(()) > 0.5:
                 img = tf.image.flip_up_down(img)
                 mask = tf.image.flip_up_down(mask)
                 grad_gt = tf.image.flip_up_down(grad_gt)
-            # Random 90-degree rotation
+            # 4. Random 90-degree rotation
             k = tf.random.uniform((), minval=0, maxval=4, dtype=tf.int32)
             img = tf.image.rot90(img, k=k)
             mask = tf.image.rot90(mask, k=k)
             grad_gt = tf.image.rot90(grad_gt, k=k)
-            # Color jitter (only on image)
+
+            # --- Photometric Augmentations (applied to image only) ---
+
+            # 5. Color jitter on unnormalized [0, 1] image
             img = tf.image.random_brightness(img, max_delta=0.2)
-            img = tf.image.random_contrast(img, lower=0.75, upper=1.25)
-            img = tf.image.random_saturation(img, lower=0.8, upper=1.2)
+            img = tf.image.random_contrast(img, lower=0.7, upper=1.3)
+            img = tf.image.random_saturation(img, lower=0.7, upper=1.3)
             img = tf.image.random_hue(img, max_delta=0.05)
-            # Gaussian noise
-            if tf.random.uniform(()) > 0.5:
-                noise = tf.random.normal(tf.shape(img), mean=0.0, stddev=0.02)
-                img = img + noise
             img = tf.clip_by_value(img, 0.0, 1.0)
-            return img, mask, grad_gt
+
+            # 6. Gaussian blur (30% probability): blur-invariant feature learning
+            if tf.random.uniform(()) > 0.7:
+                img = _gaussian_blur_tf(img, sigma_min=0.3, sigma_max=1.5)
+                img = tf.clip_by_value(img, 0.0, 1.0)
+
+            # 7. CutOut / Random Erasing (40% probability): prevents region-specific overfitting
+            if tf.random.uniform(()) > 0.6:
+                img = _cutout_tf(img, max_fraction=0.25)
+
+            # 8. Random Gaussian noise (20% probability): noise robustness
+            if tf.random.uniform(()) > 0.8:
+                noise = tf.random.normal(tf.shape(img), mean=0.0, stddev=0.03)
+                img = tf.clip_by_value(img + noise, 0.0, 1.0)
+
+            # Apply ImageNet normalization at the end
+            img_norm = (img - IMAGENET_MEAN) / IMAGENET_STD
+            return img_norm, mask, grad_gt
 
         dataset = dataset.map(_augment_fn, num_parallel_calls=tf.data.AUTOTUNE)
+    else:
+        def _norm_fn(img, mask, grad_gt):
+            img_norm = (img - IMAGENET_MEAN) / IMAGENET_STD
+            return img_norm, mask, grad_gt
+
+        dataset = dataset.map(_norm_fn, num_parallel_calls=tf.data.AUTOTUNE)
 
     dataset = dataset.batch(batch_size, drop_remainder=False)
     dataset = dataset.prefetch(tf.data.AUTOTUNE)
     return dataset
+
 
 
 def print_model_summary(model: DGNet, image_size: tuple = (384, 384)):
@@ -394,7 +516,7 @@ def print_model_summary(model: DGNet, image_size: tuple = (384, 384)):
 def train_dgnet(
     epochs: int = 10,
     batch_size: int = 8,
-    learning_rate: float = 0.0001,
+    learning_rate: float = 0.00005,
     data_dir: str = "data/raw/dataset-splitM",
     checkpoint_dir: str = "models/raw_checkpoints",
     log_dir: str = "metrics",
@@ -457,11 +579,11 @@ def train_dgnet(
         gradient_kernel=kernel,
         pretrained=True
     )
-    loss_fn = DGNetLoss(lambda_grad_loss=lambda_grad)
+    loss_fn = DGNetLoss(lambda_grad_loss=lambda_grad, label_smoothing=0.02)
 
     # Learning rate with linear warmup + cosine decay to prevent instability
     total_steps = epochs * len(train_ds)
-    warmup_steps = min(5 * len(train_ds), total_steps // 5)  # Warmup for 5 epochs or 20% of training
+    warmup_steps = min(10 * len(train_ds), total_steps // 5)  # Warmup for 10 epochs or 20% of training
 
     class WarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
         def __init__(self, initial_lr, warmup_steps, total_steps):
@@ -481,7 +603,12 @@ def train_dgnet(
             return tf.where(step < self.warmup_steps, warmup_lr, cosine_lr)
 
     lr_schedule = WarmupCosineDecay(learning_rate, warmup_steps, total_steps)
-    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule, clipnorm=0.5)
+    # AdamW properly applies weight decay as L2 regularization (Adam ignores weight_decay!)
+    optimizer = tf.keras.optimizers.AdamW(
+        learning_rate=lr_schedule,
+        weight_decay=0.0001,
+        clipnorm=1.0  # Increased from 0.5 to allow stronger gradient flow
+    )
 
     # Versioned and backward-compatible checkpoint paths
     versioned_best_weights_path = ckpt_dir / f"dgnet_{version_tag}_best.weights.h5"
@@ -573,7 +700,7 @@ def train_dgnet(
         "batch_size": batch_size,
         "epochs": epochs,
         "learning_rate": learning_rate,
-        "optimizer": "Adam",
+        "optimizer": "AdamW",
         "learning_rate_scheduler": "WarmupCosineDecay",
         "gradient_clipnorm": 0.5,
         "loss_function": "DGNetLoss (StructureLoss + MSE)",
@@ -750,11 +877,16 @@ def train_dgnet(
         except Exception as e:
             print(f"  Notice (Checkpoint Save): {e}")
 
-        # Track best val loss for early stopping
-        saved_str = ""
+        # Track best val loss for logging
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             best_val_loss_epoch = epoch
+
+        # Track best IoU and save best checkpoint based on IoU (more reliable than val loss)
+        saved_str = ""
+        if epoch_metrics["iou"] > best_val_iou:
+            best_val_iou = epoch_metrics["iou"]
+            best_val_iou_epoch = epoch
             epochs_without_improvement = 0
             try:
                 model.save_weights(str(versioned_best_weights_path))
@@ -763,14 +895,9 @@ def train_dgnet(
                 model.save(str(best_model_path))
             except Exception:
                 pass
-            saved_str = f" -> Best Checkpoint ({version_tag}) Saved!"
+            saved_str = f" -> Best IoU Checkpoint ({version_tag}, IoU={epoch_metrics['iou']:.4f}) Saved!"
         else:
             epochs_without_improvement += 1
-
-        # Track best IoU
-        if epoch_metrics["iou"] > best_val_iou:
-            best_val_iou = epoch_metrics["iou"]
-            best_val_iou_epoch = epoch
 
         # Print comprehensive epoch summary
         print(f"Epoch [{epoch:02d}/{epochs:02d}] ({epoch_time:.1f}s) | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}{saved_str}", flush=True)

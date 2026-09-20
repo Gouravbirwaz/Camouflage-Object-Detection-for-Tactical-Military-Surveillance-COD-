@@ -68,20 +68,59 @@ class ConvBR(layers.Layer):
         return x
 
 
-class DimensionalReduction(layers.Layer):
+class CBAM(layers.Layer):
     """
-    Dimensional Reduction module in official DGNet:
-    Passes extracted backbone features through two consecutive 3x3 ConvBR blocks.
+    Convolutional Block Attention Module (CBAM):
+    Sequential Channel Attention + Spatial Attention for effective feature focus.
     """
 
-    def __init__(self, out_channel: int, name: Optional[str] = None, **kwargs):
+    def __init__(self, channels: int, reduction: int = 16, name: Optional[str] = None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.channels = channels
+        reduced_ch = max(channels // reduction, 8)
+        self.fc1 = layers.Dense(reduced_ch, activation="relu", use_bias=False, name=f"{name}_fc1" if name else None)
+        self.fc2 = layers.Dense(channels, use_bias=False, name=f"{name}_fc2" if name else None)
+        self.spatial_conv = layers.Conv2D(1, kernel_size=7, padding="same", activation="sigmoid", use_bias=False, name=f"{name}_spconv" if name else None)
+
+    def call(self, x: tf.Tensor) -> tf.Tensor:
+        # Channel Attention (Global Avg & Max Pooling)
+        avg_p = tf.reduce_mean(x, axis=[1, 2], keepdims=True)
+        max_p = tf.reduce_max(x, axis=[1, 2], keepdims=True)
+        ch_attn = tf.nn.sigmoid(self.fc2(self.fc1(avg_p)) + self.fc2(self.fc1(max_p)))
+        x = x * ch_attn
+
+        # Spatial Attention
+        avg_s = tf.reduce_mean(x, axis=-1, keepdims=True)
+        max_s = tf.reduce_max(x, axis=-1, keepdims=True)
+        sp_concat = tf.concat([avg_s, max_s], axis=-1)
+        sp_attn = self.spatial_conv(sp_concat)
+        x = x * sp_attn
+        return x
+
+
+class DimensionalReduction(layers.Layer):
+    """
+    Dimensional Reduction module in official DGNet enhanced with CBAM Attention:
+    Passes extracted backbone features through two 3x3 ConvBR blocks followed by CBAM attention.
+    Includes SpatialDropout2D for regularization against overfitting on small datasets.
+    """
+
+    def __init__(self, out_channel: int, use_cbam: bool = True, dropout_rate: float = 0.1, name: Optional[str] = None, **kwargs):
         super().__init__(name=name, **kwargs)
         self.reduce1 = ConvBR(out_channel, kernel_size=3, padding="same", name=f"{name}_br1" if name else None)
         self.reduce2 = ConvBR(out_channel, kernel_size=3, padding="same", name=f"{name}_br2" if name else None)
+        self.cbam = CBAM(out_channel, name=f"{name}_cbam" if name else None) if use_cbam else None
+        # SpatialDropout2D drops entire feature maps (channels) rather than individual elements,
+        # which is more effective for convolutional features to prevent overfitting
+        self.spatial_dropout = layers.SpatialDropout2D(rate=dropout_rate, name=f"{name}_sdrop" if name else None) if dropout_rate > 0 else None
 
     def call(self, x: tf.Tensor, training: Optional[bool] = None) -> tf.Tensor:
         x = self.reduce1(x, training=training)
         x = self.reduce2(x, training=training)
+        if self.cbam is not None:
+            x = self.cbam(x)
+        if self.spatial_dropout is not None:
+            x = self.spatial_dropout(x, training=training)
         return x
 
 
@@ -168,15 +207,17 @@ class GradientInducedTransition(layers.Layer):
 
 class NeighborConnectionDecoder(layers.Layer):
     """
-    Neighbor Connection Decoder (NCD) from official DGNet:
+    Neighbor Connection Decoder (NCD) from official DGNet with Deep Supervision:
     Fuses multi-scale features hierarchically from coarse to fine (zt5 -> zt4 -> zt3)
     using multiplicative neighbor connections and cross-scale concatenation.
     Produces high-resolution, boundary-faithful camouflage predictions.
+    Deep supervision outputs (pc4, pc5) are generated for multi-scale loss supervision.
     """
 
-    def __init__(self, channel: int = 64, name: Optional[str] = None, **kwargs):
+    def __init__(self, channel: int = 64, deep_supervision: bool = True, dropout_rate: float = 0.15, name: Optional[str] = None, **kwargs):
         super().__init__(name=name, **kwargs)
         self.channel = channel
+        self.deep_supervision = deep_supervision
 
         self.conv_upsample1 = ConvBR(channel, kernel_size=3, padding="same", name=f"{name}_u1" if name else None)
         self.conv_upsample2 = ConvBR(channel, kernel_size=3, padding="same", name=f"{name}_u2" if name else None)
@@ -187,13 +228,19 @@ class NeighborConnectionDecoder(layers.Layer):
         self.conv_concat2 = ConvBR(2 * channel, kernel_size=3, padding="same", name=f"{name}_c2" if name else None)
         self.conv_concat3 = ConvBR(3 * channel, kernel_size=3, padding="same", name=f"{name}_c3" if name else None)
         self.conv4 = ConvBR(3 * channel, kernel_size=3, padding="same", name=f"{name}_c4" if name else None)
+        # Dropout before final prediction heads to prevent decoder feature co-adaptation
+        self.decoder_dropout = layers.Dropout(rate=dropout_rate, name=f"{name}_drop" if name else None) if dropout_rate > 0 else None
         self.conv5 = layers.Conv2D(1, kernel_size=1, use_bias=True, kernel_initializer="he_normal", name=f"{name}_c5" if name else None)
+
+        if self.deep_supervision:
+            self.aux_conv4 = layers.Conv2D(1, kernel_size=1, use_bias=True, kernel_initializer="he_normal", name=f"{name}_aux4" if name else None)
+            self.aux_conv5 = layers.Conv2D(1, kernel_size=1, use_bias=True, kernel_initializer="he_normal", name=f"{name}_aux5" if name else None)
 
     def _resize_to(self, x: tf.Tensor, target: tf.Tensor) -> tf.Tensor:
         h, w = tf.shape(target)[1], tf.shape(target)[2]
         return tf.image.resize(x, (h, w), method="bilinear")
 
-    def call(self, zt5: tf.Tensor, zt4: tf.Tensor, zt3: tf.Tensor, training: Optional[bool] = None) -> tf.Tensor:
+    def call(self, zt5: tf.Tensor, zt4: tf.Tensor, zt3: tf.Tensor, training: Optional[bool] = None) -> Union[tf.Tensor, Tuple[tf.Tensor, tf.Tensor, tf.Tensor]]:
         zt5_1 = zt5
         zt4_1 = self.conv_upsample1(self._resize_to(zt5, zt4), training=training) * zt4
         zt3_1 = (
@@ -209,7 +256,15 @@ class NeighborConnectionDecoder(layers.Layer):
         zt3_2 = self.conv_concat3(zt3_2, training=training)
 
         pc = self.conv4(zt3_2, training=training)
+        if self.decoder_dropout is not None:
+            pc = self.decoder_dropout(pc, training=training)
         pc = self.conv5(pc)
+
+        if self.deep_supervision:
+            pc4 = self.aux_conv4(zt4_2)
+            pc5 = self.aux_conv5(zt5_1)
+            return pc, pc4, pc5
+
         return pc
 
 
@@ -227,13 +282,13 @@ class TextureEncoder(layers.Layer):
         self.conv1 = ConvBR(64, kernel_size=7, stride=2, padding="same", name=f"{name}_c1" if name else None)
         self.conv2 = ConvBR(64, kernel_size=3, stride=2, padding="same", name=f"{name}_c2" if name else None)
         self.conv3 = ConvBR(32, kernel_size=3, stride=2, padding="same", name=f"{name}_c3" if name else None)
-        self.conv_out = ConvBR(1, kernel_size=1, stride=1, padding="same", name=f"{name}_out" if name else None)
+        self.conv_out = layers.Conv2D(1, kernel_size=1, strides=1, padding="same", use_bias=True, kernel_initializer="he_normal", name=f"{name}_out" if name else None)
 
     def call(self, x: tf.Tensor, training: Optional[bool] = None) -> Tuple[tf.Tensor, tf.Tensor]:
         feat = self.conv1(x, training=training)
         feat = self.conv2(feat, training=training)
         xg = self.conv3(feat, training=training)
-        pg = self.conv_out(xg, training=training)
+        pg = self.conv_out(xg)
         return xg, pg
 
 
@@ -268,7 +323,7 @@ class ContextEncoder(layers.Layer):
             layer_map = {l.name: l for l in base.layers}
             x3_candidates = ["expanded_conv_5_add", "expanded_conv_3_project_bn", "expanded_conv_3/Add", "expanded_conv_3_add"]
             x4_candidates = ["expanded_conv_11_add", "expanded_conv_11/Add", "expanded_conv_11_project_bn"]
-            x5_candidates = ["conv_1", "conv_1_bn", "conv_1/Add"]
+            x5_candidates = ["expanded_conv_14_add", "expanded_conv_14_project_bn", "expanded_conv_14/Add", "expanded_conv_13_add", "conv_1"]
 
             def _find_layer(candidates):
                 for c in candidates:
@@ -365,43 +420,58 @@ class DGNet(models.Model):
         zt3, zt4, zt5 = self.git(xr3, xr4, xr5, xg, training=training)
 
         # 4. Neighbor Connection Decoder (NCD)
-        pc = self.ncd(zt5, zt4, zt3, training=training)
+        ncd_out = self.ncd(zt5, zt4, zt3, training=training)
+        if isinstance(ncd_out, tuple):
+            pc, pc4, pc5 = ncd_out
+        else:
+            pc = ncd_out
+            pc4 = pc5 = None
 
-        # 5. Upsample predictions to full resolution (stride 8 -> full image)
+        # 5. Upsample predictions to full resolution
         mask_logits = tf.image.resize(pc, (target_h, target_w), method="bilinear")
         grad_logits = tf.image.resize(pg, (target_h, target_w), method="bilinear")
 
         if training or return_dict:
-            return {
+            res_dict = {
                 "mask_pred": mask_logits,
                 "grad_pred": grad_logits
             }
+            if pc4 is not None:
+                res_dict["mask_pred_aux4"] = tf.image.resize(pc4, (target_h, target_w), method="bilinear")
+            if pc5 is not None:
+                res_dict["mask_pred_aux5"] = tf.image.resize(pc5, (target_h, target_w), method="bilinear")
+            return res_dict
 
         return tf.nn.sigmoid(mask_logits)
 
 
 class DGNetLoss(losses.Loss):
     """
-    Official DGNet Multi-Task Structure Loss (F3Net AAAI 2020 / DGNet MIR 2023):
-    Total_Loss = structure_loss(mask_logits, gt_mask) + lambda_grad * MSE(grad_pred, grad_gt)
-
-    Key properties:
-    - Adaptive boundary & foreground weight map:
-      weit = 1.0 + 5.0 * |AvgPool2D(gt_mask, 31x31) - gt_mask|
-    - Weighted Binary Cross-Entropy (WBCE)
-    - Weighted IoU Loss (WIOU)
-    - Auxiliary Mean Squared Error on object-level gradient map
+    Official DGNet Multi-Task Structure Loss + Novel Deep Supervision & Boundary IoU Loss:
+    Total_Loss = structure_loss(mask_logits, gt_mask)
+                 + 0.5 * structure_loss(mask_aux4, gt_mask)
+                 + 0.25 * structure_loss(mask_aux5, gt_mask)
+                 + 0.5 * boundary_loss(mask_logits, gt_mask)
+                 + lambda_grad * MSE(grad_pred, grad_gt)
     """
 
-    def __init__(self, lambda_grad_loss: float = 1.0, name: str = "dgnet_loss", **kwargs):
+    def __init__(self, lambda_grad_loss: float = 1.0, label_smoothing: float = 0.02, name: str = "dgnet_loss", **kwargs):
         super().__init__(name=name, **kwargs)
         self.lambda_grad_loss = lambda_grad_loss
+        self.label_smoothing = label_smoothing
+        # 3x3 Laplacian kernel for edge detection
+        self.laplacian_kernel = tf.constant([[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]], dtype=tf.float32)
+        self.laplacian_kernel = tf.reshape(self.laplacian_kernel, [3, 3, 1, 1])
 
     def structure_loss(self, y_true: tf.Tensor, y_pred_logits: tf.Tensor) -> tf.Tensor:
         """
         Structure loss matching official DGNet (F3Net AAAI 2020).
+        Label smoothing applied to prevent overconfident predictions on small datasets.
         """
         y_true_f = tf.cast(y_true, tf.float32)
+        # Apply label smoothing: hard 0/1 labels become soft 0.02/0.98
+        if self.label_smoothing > 0:
+            y_true_f = y_true_f * (1.0 - self.label_smoothing) + self.label_smoothing / 2.0
 
         # Adaptive spatial weight map (kernel 31x31, stride 1, padding same)
         avg_pool = tf.nn.avg_pool2d(y_true_f, ksize=[1, 31, 31, 1], strides=[1, 1, 1, 1], padding="SAME")
@@ -419,17 +489,43 @@ class DGNetLoss(losses.Loss):
 
         return tf.reduce_mean(wbce + wiou)
 
+    def boundary_loss(self, y_true: tf.Tensor, y_pred_logits: tf.Tensor) -> tf.Tensor:
+        """Boundary IoU loss to sharpen object boundaries."""
+        y_true_f = tf.cast(y_true, tf.float32)
+        pred_sig = tf.nn.sigmoid(y_pred_logits)
+
+        gt_edges = tf.abs(tf.nn.conv2d(y_true_f, self.laplacian_kernel, strides=[1, 1, 1, 1], padding="SAME"))
+        gt_edges = tf.clip_by_value(gt_edges, 0.0, 1.0)
+
+        pred_edges = tf.abs(tf.nn.conv2d(pred_sig, self.laplacian_kernel, strides=[1, 1, 1, 1], padding="SAME"))
+        pred_edges = tf.clip_by_value(pred_edges, 0.0, 1.0)
+
+        inter = tf.reduce_sum(gt_edges * pred_edges, axis=[1, 2, 3])
+        union = tf.reduce_sum(gt_edges + pred_edges - gt_edges * pred_edges, axis=[1, 2, 3])
+        boundary_iou = 1.0 - (inter + 1.0) / (union + 1.0)
+        return tf.reduce_mean(boundary_iou)
+
     def call(self, y_true: tf.Tensor, y_pred_dict: Dict[str, tf.Tensor]) -> tf.Tensor:
         mask_logits = y_pred_dict["mask_pred"]
         grad_logits = y_pred_dict["grad_pred"]
 
         seg_loss = self.structure_loss(y_true, mask_logits)
 
+        # Auxiliary deep supervision losses
+        if "mask_pred_aux4" in y_pred_dict:
+            seg_loss += 0.5 * self.structure_loss(y_true, y_pred_dict["mask_pred_aux4"])
+        if "mask_pred_aux5" in y_pred_dict:
+            seg_loss += 0.25 * self.structure_loss(y_true, y_pred_dict["mask_pred_aux5"])
+
+        # Boundary refinement loss
+        b_loss = self.boundary_loss(y_true, mask_logits)
+        seg_loss += 0.5 * b_loss
+
         # Auxiliary gradient loss (MSE)
         grad_gt_target = y_pred_dict.get("gt_grad", y_pred_dict.get("grad_gt", None))
         if grad_gt_target is not None:
             gt_grad = tf.cast(grad_gt_target, tf.float32)
-            grad_pred_val = tf.clip_by_value(grad_logits, 0.0, 1.0)
+            grad_pred_val = tf.nn.sigmoid(grad_logits)
             grad_loss = tf.reduce_mean(tf.square(grad_pred_val - gt_grad))
             total_loss = seg_loss + self.lambda_grad_loss * grad_loss
         else:

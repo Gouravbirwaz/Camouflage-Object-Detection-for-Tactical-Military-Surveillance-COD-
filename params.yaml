@@ -21,10 +21,12 @@ model:
 
 train:
   epochs: 100
-  learning_rate: 0.0001
+  learning_rate: 0.00005
   weight_decay: 0.0001
   optimizer: "adamw"
   lr_scheduler: "cosine"
+  warmup_epochs: 10
+  label_smoothing: 0.02
   lambda_grad_loss: 1.0               # Weight balancing parameter lambda for gradient supervision loss (official: 1.0)
 
 optimization:

@@ -88,7 +88,11 @@ logs/
 mlruns/
 mlartifacts/
 .trash/
+docker/mlflow_db/
+scratch/
+tests/unit/output/
 
 # OS generated files
 .DS_Store
 Thumbs.db
+tests/unit/output

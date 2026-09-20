@@ -1,0 +1,23 @@
+services:
+  mlflow-server:
+    image: ghcr.io/mlflow/mlflow:v3.10.0-full
+    container_name: mlflow_tracking_server
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlflow_db:/mlflow
+      - /data:/data
+    environment:
+      - MLFLOW_TRACKING_URI=http://0.0.0.0:5000
+      - MLFLOW_S3_ENDPOINT_URL=https://s3.hf.co/gouravbirwaz
+      - AWS_ENDPOINT_URL_S3=https://s3.hf.co/gouravbirwaz
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --cors-allowed-origins "*"
+      --allowed-hosts "*"
+      --workers 1
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --default-artifact-root /data/mlflow-artifacts

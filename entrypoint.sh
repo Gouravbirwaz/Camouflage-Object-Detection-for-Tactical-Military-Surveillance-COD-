@@ -45,6 +45,24 @@ mkdir -p "$LOG_DIR_RESOLVED"
 mkdir -p "models/raw_checkpoints"
 mkdir -p "metrics"
 
+# Auto-start embedded MLflow tracking server if no external URI provided
+if [ -z "$MLFLOW_TRACKING_URI" ] || [ "$MLFLOW_TRACKING_URI" = "http://127.0.0.1:5000" ] || [ "$MLFLOW_TRACKING_URI" = "http://localhost:5000" ]; then
+    echo "[MLflow Server] Auto-starting embedded MLflow tracking server on port 5000..."
+    mkdir -p "$LOG_DIR_RESOLVED/mlflow_db"
+    mkdir -p "$LOG_DIR_RESOLVED/mlflow_artifacts"
+    mlflow server \
+        --host 0.0.0.0 \
+        --port 5000 \
+        --cors-allowed-origins "*" \
+        --allowed-hosts "*" \
+        --workers 1 \
+        --backend-store-uri "sqlite:///$LOG_DIR_RESOLVED/mlflow_db/mlflow.db" \
+        --default-artifact-root "$LOG_DIR_RESOLVED/mlflow_artifacts" &
+    MLFLOW_PID=$!
+    export MLFLOW_TRACKING_URI="http://127.0.0.1:5000"
+    echo "[MLflow Server] Embedded MLflow server running on PID $MLFLOW_PID at http://127.0.0.1:5000"
+fi
+
 # Start background web health check server on port 7860 for HF Space
 python3 scripts/space_monitor.py &
 MONITOR_PID=$!
@@ -65,10 +83,14 @@ fi
 
 python3 scripts/hf_sync.py --download-checkpoints --ckpt-dir "$CKPT_DIR_RESOLVED" --download-dataset || echo "Notice: Checkpoint/dataset sync skipped or using mounted S3 dataset."
 
-# 2. Run DGNet Training
+# 2. Run DGNet Preprocessing & Training
 echo ""
-echo "[Step 2/3] Launching DGNet TensorFlow GPU Training..."
-echo "[Step 2/3] DGNet GPU Training in progress (Epochs: ${EPOCHS:-50}, Version: ${MODEL_VERSION:-v2.0_official_dgnet})..." > /tmp/training_status.txt
+echo "[Step 2/3] Preparing GT masks & launching DGNet TensorFlow GPU Training..."
+echo "[Step 2/3] GT PNG conversion & DGNet GPU Training in progress (Epochs: ${EPOCHS:-200}, Batch Size: ${BATCH_SIZE:-8}, Version: ${MODEL_VERSION:-v2.0_official_dgnet})..." > /tmp/training_status.txt
+
+# Convert training GT masks from JPEG to lossless PNG if needed
+echo "[GT Prep] Running GT mask conversion (JPEG to PNG)..."
+python3 scripts/convert_gt_to_png.py --data-dir ${DATA_DIR:-data/raw/dataset-splitM} || echo "Notice: GT mask conversion completed or skipped."
 
 RESUME_FLAG=""
 if [ "$RESUME" = "true" ] || [ "$RESUME" = "1" ]; then
@@ -77,8 +99,8 @@ fi
 
 python3 -u scripts/DGnet.py \
     --train \
-    --epochs ${EPOCHS:-50} \
-    --batch-size ${BATCH_SIZE:-16} \
+    --epochs ${EPOCHS:-200} \
+    --batch-size ${BATCH_SIZE:-8} \
     --data-dir ${DATA_DIR:-data/raw/dataset-splitM} \
     --checkpoint-dir "$CKPT_DIR_RESOLVED" \
     --log-dir "$LOG_DIR_RESOLVED" \

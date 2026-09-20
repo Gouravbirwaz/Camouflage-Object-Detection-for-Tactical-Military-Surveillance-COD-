@@ -1,0 +1,197 @@
+================================================================================
+DGNet MODEL FAILURE REPORT: OVERFITTING AND NOISY SCATTERED PREDICTIONS
+Date: 2026-09-20
+Component: src/models/dgnet.py, scripts/DGnet.py, tests/test_model_inference.py
+Affected Checkpoint: models/raw_checkpoints/dgnet_v1.0_epoch_050.weights.h5 / dgnet_best.weights.h5
+================================================================================
+
+1. INCIDENT OVERVIEW & SYMPTOMS
+--------------------------------------------------------------------------------
+Following the resolution of the foreground collapse failure mode and retraining 
+for 100 epochs (with 50 logged validation epochs recorded in metrics/train_metrics.json), 
+inspection of inference outputs across the test split revealed a severe degradation 
+in prediction fidelity:
+
+- The model outputs scattered, speckled pseudo-random noise across the entire frame 
+  rather than a clean silhouette matching the ground truth mask.
+- In color probability heatmaps (JET colormap), predictions present as hundreds of 
+  diffuse red and yellow hotspots scattered arbitrarily over high-frequency background 
+  elements (rocks, foliage, tree bark, grass).
+- Contour overlays (Panel 5 of image comparisons and *_contour.png) generate 
+  hundreds of fragmented false-positive bounding contours across background regions, 
+  rendering target identification impossible.
+- Specific Failure Case (image519.jpg):
+  * Test sample image519 displays a camouflaged soldier in tactical gear positioned 
+    against a rocky outdoor background.
+  * Ground truth mask (image519.png) clearly defines the target body silhouette.
+  * The trained DGNet model completely fails to detect the soldier's body, head, 
+    or equipment.
+  * Instead of highlighting the camouflaged soldier, the model produces a speckled, 
+    salt-and-pepper noise distribution across the surrounding rocks and terrain.
+- Quantitative Deficiency:
+  * Best validation Intersection-over-Union (IoU) peaked at only 0.463 (epoch 50).
+  * In tactical military surveillance and camouflage object detection benchmarks, 
+    an IoU of >= 0.70 is the minimum requirement for operational target segmentation.
+
+
+2. NUMERICAL MEASUREMENTS (TRAINING METRICS DIAGNOSTIC)
+--------------------------------------------------------------------------------
+Direct inspection of metrics/train_metrics.json reveals pronounced divergence 
+between training and validation performance:
+
+- Final Training Total Loss:      0.210  (epoch 50)
+- Final Validation Total Loss:    1.240  (epoch 50)
+- Train vs. Val Loss Gap:         1.030  (Val loss is ~6x higher than train loss)
+- Peak Validation IoU:            0.463  (achieved at epoch 50; plateaued below 0.50)
+- Validation Loss Instability:    Severe loss spike to 14.588 at epoch 10, indicating 
+                                  gradient shocks and optimization instability.
+- Prediction Confidence Profile:  Raw output probabilities post-sigmoid across test 
+                                  images are constrained in a low-confidence band 
+                                  [0.0, 0.5], with no localized high-confidence 
+                                  foreground detections (p > 0.85).
+
+Metric Summary Table:
++------------------------+------------------+------------------+-----------------+
+| Metric Name            | Epoch 1          | Epoch 10 (Spike) | Epoch 50 (Best) |
++------------------------+------------------+------------------+-----------------+
+| Train Total Loss       | 0.2799           | 0.2924           | 0.2102          |
+| Validation Total Loss  | 2.0690           | 14.5881          | 1.2395          |
+| Validation IoU         | 0.0014           | 0.2119           | 0.4631          |
+| Train / Val Loss Ratio | 7.39x            | 49.89x           | 5.90x           |
++------------------------+------------------+------------------+-----------------+
+
+Observation:
+The training loss consistently drops (from 0.357 to 0.210), while validation loss 
+stagnates around 1.24 - 1.75 with persistent wild fluctuations. A 6x discrepancy 
+between train and validation loss is a classic textbook indicator of severe model 
+overfitting and poor generalization on unseen camouflage distributions.
+
+
+3. ROOT CAUSE ANALYSIS (5 IDENTIFIED CAUSES)
+--------------------------------------------------------------------------------
+Comprehensive architectural and pipeline investigation revealed five distinct, 
+compounding root causes:
+
+Cause A: Severe Overfitting Due to Small Dataset Scale
+  - The tactical military surveillance dataset contains only 748 training images 
+    in data/raw/dataset-splitM/Training.
+  - For reference, the original DGNet paper ("Deep Gradient Network for Camouflaged 
+    Object Detection", MIR 2023) trained on COD10K (10,000 images) combined with 
+    CAMO (1,250 images), totaling over 10,000 diverse samples.
+  - Operating with 13x less training data on a complex dual-branch architecture 
+    (MobileNetV3Large + Texture Encoder + GIT + NCD decoder) caused the network 
+    parameters (~3.6M to ~5.0M) to memorize individual background textures rather 
+    than learning invariant, generalizable camouflage semantic boundaries.
+  - The 6x validation-to-train loss gap directly confirms sample memorization.
+
+Cause B: Insufficient Data Augmentation in Training Pipeline
+  - In scripts/DGnet.py (create_tf_dataset), augmentation was restricted to basic 
+    operations:
+      * Random horizontal flip (p = 0.5)
+      * Random vertical flip (p = 0.5)
+      * Random 90-degree discrete rotations
+      * Mild color jitter (brightness delta 0.15, contrast 0.8-1.2, saturation 0.8-1.2)
+  - Missing vital augmentation techniques:
+      * RandomResizedCrop: Scale variation is critical; camouflaged military targets 
+        appear at vastly different distances (ranges from 50m to 1000m). Without scale 
+        perturbation, the network fits to fixed pixel scales.
+      * Gaussian Blur: Camouflage imagery often exhibits focal depth variations, optical 
+        blur, and atmospheric haze.
+      * CutOut / Random Erasing: Without region masking, the model fixates on accidental 
+        local context features instead of target silhouettes.
+      * Elastic Grid Distortion: Natural camouflage patterns blend along non-rigid 
+        terrain; lack of geometric deformation prevents robust boundary extraction.
+  - For an ultra-compact 748-image dataset, aggressive, multi-modal data augmentation 
+    is mathematically mandatory to simulate a manifold of 10,000+ distinct samples.
+
+Cause C: Complete Absence of Regularization in Model Architecture & Optimizer
+  - Zero Dropout in Network Backbone & Heads:
+    * In src/models/dgnet.py, the original implementation had zero dropout layers 
+      throughout ContextEncoder, TextureEncoder, GradientInducedTransition, and 
+      NeighborConnectionDecoder.
+    * No spatial dropout was present in the DimensionalReduction blocks (dr3, dr4, dr5).
+  - Optimizer Weight Decay Bug:
+    * While params.yaml configured `weight_decay: 0.0001` under `train`, scripts/DGnet.py 
+      instantiated standard `tf.keras.optimizers.Adam(learning_rate=lr_schedule, clipnorm=0.5)`.
+    * Standard Keras Adam completely ignores the weight decay parameter unless AdamW 
+      (`tf.keras.optimizers.AdamW`) is explicitly used. As a consequence, true L2 
+      weight decay regularization was exactly 0.0 during training!
+  - Gradient Clipping Margin:
+    * The clipnorm threshold was set to 0.5. Combined with unregularized weights, 
+      this overly tight gradient norm clipping impeded deep gradient signal flow 
+      from the boundary loss back through the multi-scale stages.
+
+Cause D: Lossy JPEG Compression Artifacts in Ground Truth Training Masks
+  - Training GT folder (`data/raw/dataset-splitM/Training/GT/`) stores masks in lossy 
+    `.jpg` format (e.g., image1.jpg, image100.jpg, 317+ files).
+  - Testing GT folder (`data/raw/dataset-splitM/Testing/GT/`) stores masks in lossless 
+    `.png` format (e.g., image501.png, image519.png).
+  - Technical Impact:
+    * JPEG uses 8x8 block Discrete Cosine Transform (DCT) lossy compression.
+    * Sharp binary transitions (0 -> 255) along object contours suffer high-frequency 
+      ringing artifacts (Gibbs phenomenon), creating blurred halos with intermediate 
+      pixel values (e.g., values ranging between 15 and 240).
+    * In DGNet, the 31x31 adaptive structure loss (`weit = 1.0 + 5.0 * |AvgPool2D(mask) - mask|`) 
+      and Laplacian boundary loss compute second-order spatial gradients directly on GT.
+    * JPEG compression ringing directly corrupts the supervision signal at the precise 
+      boundary pixels where camouflage detection requires sub-pixel accuracy.
+
+Cause E: Suboptimal Training Hyperparameters & Checkpoint Selection
+  - Initial Learning Rate:
+    * 1e-4 (0.0001) was inherited from official DGNet (which was designed for 11,250 
+      images). On 748 images, 1e-4 causes parameter updates that are too coarse, 
+      overshooting narrow generalization valleys.
+  - Warmup Duration:
+    * Warmup was limited to 5 epochs (only ~94 steps per epoch at batch size 8 = 470 steps), 
+      which was too brief to stabilize the randomly initialized decoder layers and CBAM 
+      attention blocks, precipitating the epoch 10 loss spike (14.588).
+  - Flawed Checkpoint Selection Metric:
+    * The training script saved `best_weights` purely based on minimum `val_total_loss`.
+    * In multi-task loss (Structure Loss + Deep Supervision + Boundary Loss + Gradient MSE), 
+      validation loss fluctuates substantially based on edge penalties and background 
+      statistics. A lower validation loss often corresponds to an under-predicting model 
+      rather than the highest segmentation quality.
+    * Checkpoints should be saved based on peak validation IoU, which directly evaluates 
+      camouflage target delineation.
+  - Lack of Dynamic Learning Rate Reduction:
+    * No plateau scheduler existed to reduce learning rates when validation IoU stalled.
+
+
+4. WHY PREDICTIONS MANIFEST SPECIFICALLY AS NOISE
+--------------------------------------------------------------------------------
+A key mystery was why the failure manifested as scattered salt-and-pepper noise 
+rather than uniform blank or solid masks:
+
+Step 1: Low-Confidence Ambiguity Regime
+  Due to memorization and lack of strong semantic generalization, the network 
+  never develops sufficient confidence to push foreground logits into positive 
+  saturation. Raw post-sigmoid probabilities remain diffuse and hover in the 
+  ambiguous range of [0.05, 0.40] across the image.
+
+Step 2: Fitting to High-Frequency Surface Textures
+  Because camouflaged targets share identical color and texture distributions with 
+  their background (rocks, foliage, soil), the gradient branch and convolutional 
+  filters learn that high-frequency edge textures correlate with target boundaries. 
+  Without proper semantic regularization, any sharp background texture (cracks in 
+  stones, leaf edges) triggers weak positive activations.
+
+Step 3: Test Pipeline Min-Max Sharpening Amplification
+  In tests/test_model_inference.py (lines 93-97 and 616-620), the evaluation 
+  pipeline applies Min-Max dynamic range scaling:
+  
+      if sharpen and (p_max - p_min) > 1e-4:
+          scaled_prob = (pred_prob - p_min) / (p_max - p_min)
+  
+  When the raw model output has a narrow, flat distribution (e.g., p_min = 0.02, 
+  p_max = 0.38), min-max scaling artificially stretches this flat noise floor to 
+  the entire [0.0, 1.0] interval!
+  * Raw background noise of 0.30 gets stretched to: (0.30 - 0.02) / 0.36 = 0.78.
+
+Step 4: Binary Thresholding Creates Salt-and-Pepper Artifacts
+  Applying a threshold of 0.5 to the artificially stretched noise map converts 
+  every amplified background texture hotspot into an isolated binary foreground 
+  island (value 1.0).
+  Result: Hundreds of micro-contours scatter across rocks and grass, while the true 
+  target (which had similar raw probability ~0.35) blends indistinguishably into 
+  the background noise field.
+================================================================================

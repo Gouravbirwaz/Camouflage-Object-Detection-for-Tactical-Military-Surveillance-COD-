@@ -36,13 +36,13 @@ ENV DATA_DIR=data/raw/dataset-splitM
 ENV MODEL_DIR=models
 ENV CHECKPOINT_DIR=models/raw_checkpoints
 ENV LOG_DIR=metrics
-ENV EPOCHS=50
-ENV BATCH_SIZE=16
+ENV EPOCHS=200
+ENV BATCH_SIZE=8
 ENV RESUME=false
 ENV MODEL_VERSION=v2.0_official_dgnet
 
 # MLflow Experiment Tracking & S3 Artifact Defaults
-ENV MLFLOW_TRACKING_URI=""
+ENV MLFLOW_TRACKING_URI=http://3.84.17.133:5000
 ENV MLFLOW_EXPERIMENT_NAME=COD-Camouflage-Detection
 ENV MLFLOW_S3_ENDPOINT_URL=https://s3.hf.co/gouravbirwaz
 ENV AWS_ENDPOINT_URL_S3=https://s3.hf.co/gouravbirwaz
