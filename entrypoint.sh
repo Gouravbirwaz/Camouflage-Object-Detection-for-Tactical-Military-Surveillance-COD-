@@ -92,12 +92,18 @@ python3 scripts/hf_sync.py --download-checkpoints --ckpt-dir "$CKPT_DIR_RESOLVED
 
 # 2. Run DGNet Preprocessing & Training
 echo ""
-echo "[Step 2/3] Preparing GT masks & launching DGNet TensorFlow GPU Training..."
-echo "[Step 2/3] GT PNG conversion & DGNet GPU Training in progress (Epochs: ${EPOCHS:-1}, Batch Size: ${BATCH_SIZE:-8}, Version: ${MODEL_VERSION:-v2.0_official_dgnet})..." > /tmp/training_status.txt
+echo "[Step 2/3] Preparing GT masks, dataset augmentation & launching DGNet TensorFlow GPU Training..."
+echo "[Step 2/3] Preparing dataset & DGNet GPU Training in progress (Epochs: ${EPOCHS:-50}, Batch Size: ${BATCH_SIZE:-8}, Version: ${MODEL_VERSION:-v2.0_official_dgnet})..." > /tmp/training_status.txt
 
 # Convert training GT masks from JPEG to lossless PNG if needed
 echo "[GT Prep] Running GT mask conversion (JPEG to PNG)..."
 python3 scripts/convert_gt_to_png.py --data-dir ${DATA_DIR:-data/raw/dataset-splitM} || echo "Notice: GT mask conversion completed or skipped."
+
+# Generate military tactical augmented dataset if not already present
+if [ ! -d "data/augmented/military_tactical/Training/images" ] && [ ! -d "/data/augmented/military_tactical/Training/images" ]; then
+    echo "[Data Prep] Generating military tactical augmented dataset (4x multiplier)..."
+    python3 scripts/generate_augmented_dataset.py --raw-dir ${DATA_DIR:-data/raw/dataset-splitM} --multiplier 4 || echo "Notice: Augmented dataset generation completed or skipped."
+fi
 
 RESUME_FLAG=""
 if [ "$RESUME" = "true" ] || [ "$RESUME" = "1" ]; then
@@ -106,8 +112,8 @@ fi
 
 python3 -u scripts/DGnet.py \
     --train \
-    --epochs ${EPOCHS:-1} \
-    --batch-size ${BATCH_SIZE:-3} \
+    --epochs ${EPOCHS:-50} \
+    --batch-size ${BATCH_SIZE:-8} \
     --data-dir ${DATA_DIR:-data/raw/dataset-splitM} \
     --checkpoint-dir "$CKPT_DIR_RESOLVED" \
     --log-dir "$LOG_DIR_RESOLVED" \

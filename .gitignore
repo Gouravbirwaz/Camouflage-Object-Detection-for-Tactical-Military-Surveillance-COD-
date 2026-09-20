@@ -64,6 +64,8 @@ data/processed/*
 !data/processed/.gitkeep
 data/synthetic/*
 !data/synthetic/.gitkeep
+data/augmented/*
+!data/augmented/.gitkeep
 
 # Heavy Model Checkpoints & Optimized Runtimes (Tracked by DVC)
 models/raw_checkpoints/*.pt
