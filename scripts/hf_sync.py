@@ -54,9 +54,8 @@ except ImportError:
     sys.exit(1)
 
 
-DEFAULT_TOKEN = "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"
 REPO_ID = os.getenv("HF_REPO_ID", hf_cfg.get("repo_id", "gouravbirwaz/COD_dataset"))
-HF_TOKEN = os.getenv("HF_TOKEN") or hf_cfg.get("token") or DEFAULT_TOKEN
+HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN") or hf_cfg.get("token", None)
 
 if HF_TOKEN:
     HF_TOKEN = HF_TOKEN.strip()
