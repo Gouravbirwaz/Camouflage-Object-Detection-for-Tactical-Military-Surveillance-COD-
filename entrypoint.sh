@@ -31,7 +31,7 @@ export CHECKPOINT_DIR="$CKPT_DIR_RESOLVED"
 export LOG_DIR="$LOG_DIR_RESOLVED"
 
 # MLflow Experiment Tracking & Hugging Face S3 Gateway Defaults
-export MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-}"
+export MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-http://127.0.0.1:5000}"
 export MLFLOW_EXPERIMENT_NAME="${MLFLOW_EXPERIMENT_NAME:-COD-Camouflage-Detection}"
 export MLFLOW_S3_ENDPOINT_URL="${MLFLOW_S3_ENDPOINT_URL:-https://s3.hf.co/gouravbirwaz}"
 export AWS_ENDPOINT_URL_S3="${AWS_ENDPOINT_URL_S3:-https://s3.hf.co/gouravbirwaz}"
@@ -99,8 +99,8 @@ fi
 
 python3 -u scripts/DGnet.py \
     --train \
-    --epochs ${EPOCHS:-10} \
-    --batch-size ${BATCH_SIZE:-8} \
+    --epochs ${EPOCHS:-1} \
+    --batch-size ${BATCH_SIZE:-3} \
     --data-dir ${DATA_DIR:-data/raw/dataset-splitM} \
     --checkpoint-dir "$CKPT_DIR_RESOLVED" \
     --log-dir "$LOG_DIR_RESOLVED" \

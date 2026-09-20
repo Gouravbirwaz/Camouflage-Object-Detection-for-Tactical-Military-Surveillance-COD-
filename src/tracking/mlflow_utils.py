@@ -121,8 +121,18 @@ class MLflowTracker:
                     sock.close()
                 except Exception as conn_err:
                     print(f"[MLflow] Notice: Remote tracking server at {self.tracking_uri} is unreachable ({conn_err}).")
-                    print("[MLflow] Disabling remote MLflow tracking to run training without network delays.")
-                    self.enabled = False
+                    if self.tracking_uri != "http://127.0.0.1:5000":
+                        print("[MLflow] Falling back to embedded local MLflow server at http://127.0.0.1:5000...")
+                        self.tracking_uri = "http://127.0.0.1:5000"
+                        try:
+                            sock = socket.create_connection(("127.0.0.1", 5000), timeout=2.0)
+                            sock.close()
+                            self.enabled = True
+                        except Exception:
+                            print("[MLflow] Embedded server not reachable. Disabling MLflow tracking.")
+                            self.enabled = False
+                    else:
+                        self.enabled = False
 
             if self.enabled:
                 try:
