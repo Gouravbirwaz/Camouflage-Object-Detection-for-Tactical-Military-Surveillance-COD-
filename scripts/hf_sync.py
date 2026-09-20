@@ -223,9 +223,30 @@ def upload_logs(log_dir: str = None):
         log_dir = os.getenv("LOG_DIR", train_cfg.get("log_dir", "metrics"))
 
     primary_path = _resolve_path(log_dir)
-    if not primary_path.exists():
-        print(f"[HF Sync] Log directory {primary_path.resolve()} does not exist.")
-        return
+    primary_path.mkdir(parents=True, exist_ok=True)
+
+    # Gather logs & MLflow database from all candidate log locations
+    candidate_paths = [
+        primary_path,
+        Path("/data/metrics"),
+        Path("/app/metrics"),
+        Path("/app/data/metrics"),
+        PROJECT_ROOT / "metrics",
+        PROJECT_ROOT / "logs",
+    ]
+
+    for cp in candidate_paths:
+        try:
+            if cp.exists() and cp.is_dir() and cp.resolve() != primary_path.resolve():
+                for item in cp.rglob("*"):
+                    if item.is_file() and not item.name.startswith("."):
+                        rel = item.relative_to(cp)
+                        target = primary_path / rel
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        if not target.exists() or item.stat().st_mtime > target.stat().st_mtime:
+                            shutil.copy2(str(item), str(target))
+        except Exception:
+            pass
 
     print(f"\n[HF Sync] Uploading training logs & MLflow metrics folder from {primary_path.resolve()} to '{REPO_ID}' (path_in_repo='metrics')...")
     api = get_api()
