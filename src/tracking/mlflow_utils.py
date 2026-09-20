@@ -123,7 +123,22 @@ class MLflowTracker:
         db_dir = resolved_log_dir / "mlflow_db"
         db_dir.mkdir(parents=True, exist_ok=True)
         db_file = db_dir / "mlflow.db"
-        
+
+        # Check and auto-migrate legacy alembic schema version if present
+        if db_file.exists():
+            try:
+                import sqlite3
+                conn = sqlite3.connect(str(db_file))
+                tables = [t[0] for t in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+                if 'alembic_version' in tables:
+                    ver = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+                    if ver and ver[0] == 'b7e2c1a4d9f3':
+                        conn.execute("UPDATE alembic_version SET version_num = '1b5f0d9ad7c1'")
+                        conn.commit()
+                conn.close()
+            except Exception:
+                pass
+
         # Absolute SQLite URI formatted for Linux and Windows compatibility
         posix_path = db_file.resolve().as_posix()
         if posix_path.startswith("/"):

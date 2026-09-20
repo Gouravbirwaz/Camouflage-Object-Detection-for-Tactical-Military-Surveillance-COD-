@@ -299,6 +299,23 @@ def download_logs(log_dir: str = None):
                     shutil.copytree(str(item), str(target), dirs_exist_ok=True)
                 else:
                     shutil.copy2(str(item), str(target))
+
+        # Check and fix sqlite alembic schema for MLflow 3.x compatibility
+        db_file = primary_path / "mlflow_db" / "mlflow.db"
+        if db_file.exists():
+            try:
+                import sqlite3
+                conn = sqlite3.connect(str(db_file))
+                tables = [t[0] for t in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+                if 'alembic_version' in tables:
+                    ver = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+                    if ver and ver[0] == 'b7e2c1a4d9f3':
+                        conn.execute("UPDATE alembic_version SET version_num = '1b5f0d9ad7c1'")
+                        conn.commit()
+                conn.close()
+            except Exception:
+                pass
+
         print("[HF Sync] Logs & MLflow database downloaded successfully!\n")
     except Exception as e:
         print(f"[HF Sync] Log download notice: {e}")
