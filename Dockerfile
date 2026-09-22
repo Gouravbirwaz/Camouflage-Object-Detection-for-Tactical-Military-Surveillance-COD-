@@ -23,6 +23,7 @@ COPY src/ ./src/
 COPY scripts/ ./scripts/
 COPY configs/ ./configs/
 COPY data/ ./data/
+COPY .dvc/ ./.dvc/
 COPY params.yaml .
 COPY dvc.yaml .
 COPY entrypoint.sh .
@@ -36,18 +37,19 @@ ENV DATA_DIR=data/raw/dataset-splitM
 ENV MODEL_DIR=models
 ENV CHECKPOINT_DIR=models/raw_checkpoints
 ENV LOG_DIR=metrics
-ENV EPOCHS=1
+ENV EPOCHS=100
 ENV BATCH_SIZE=8
 ENV RESUME=false
 ENV MODEL_VERSION=v2.0_official_dgnet
+ENV TRAINING_PLATFORM=huggingface
 
 # MLflow Experiment Tracking & S3 Artifact Defaults
-ENV MLFLOW_TRACKING_URI=http://3.84.17.133:5000
+ENV MLFLOW_TRACKING_URI=http://127.0.0.1:5000
 ENV MLFLOW_EXPERIMENT_NAME=COD-Camouflage-Detection
 ENV MLFLOW_S3_ENDPOINT_URL=https://s3.hf.co/gouravbirwaz
 ENV AWS_ENDPOINT_URL_S3=https://s3.hf.co/gouravbirwaz
 ENV MLFLOW_ARTIFACT_LOCATION=s3://COD_dataset/dvc-store/mlflow-artifacts
-ENV HF_S3_URI=s3://COD_dataset/dvc-storecls
+ENV HF_S3_URI=s3://COD_dataset/dvc-store
 
 ENV AWS_DEFAULT_REGION=us-east-1
 

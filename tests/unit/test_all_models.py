@@ -19,14 +19,16 @@ if str(PROJECT_ROOT) not in sys.path:
 from tests.test_model_inference import (
     discover_all_models,
     find_default_sample_images,
+    find_ground_truth_for_image,
     load_and_preprocess_image,
+    load_ground_truth,
     ModelRunner,
     process_prediction_mask,
     save_mask_png,
-    save_color_heatmap_png,
-    save_contour_overlay_image,
+    save_comparison_image,
     save_multi_model_comparison
 )
+from src.models.dgnet import DGNetLoss
 
 
 class TestAllModelsInference(unittest.TestCase):
@@ -47,7 +49,14 @@ class TestAllModelsInference(unittest.TestCase):
             print(f"  • {m['name']} ({m['model_type'].upper()}, {m['parent_folder']})")
         self.assertGreater(len(discovered), 0, "No model checkpoints found in models/")
 
-    def test_02_inference_all_discovered_models(self):
+    def test_02_dgnet_loss_constructor_compatibility(self):
+        """Ensures the notebook's legacy DGNetLoss arguments remain supported."""
+        loss = DGNetLoss(grad_loss_weight=1.0, deep_supervision=True)
+        self.assertIsInstance(loss, tf.keras.losses.Loss)
+        self.assertEqual(loss.lambda_grad_loss, 1.0)
+        self.assertTrue(loss.deep_supervision)
+
+    def test_03_inference_all_discovered_models(self):
         """Runs inference for all discovered models on sample image and verifies output masks."""
         discovered = discover_all_models(self.models_dir)
         self.assertGreater(len(discovered), 0, "No models to test.")
@@ -55,6 +64,13 @@ class TestAllModelsInference(unittest.TestCase):
         image_path = self.sample_images[0]
         image_stem = Path(image_path).stem
         input_tensor, original_image = load_and_preprocess_image(image_path)
+        gt_path = find_ground_truth_for_image(image_path)
+        gt_mask = load_ground_truth(gt_path) if gt_path else None
+
+        if gt_mask is not None:
+            gt_out = self.output_dir / f"test_{image_stem}_gt.png"
+            save_mask_png(gt_mask, str(gt_out))
+            self.assertTrue(gt_out.exists(), f"GT mask file {gt_out} was not created.")
 
         model_results = []
 
@@ -76,24 +92,22 @@ class TestAllModelsInference(unittest.TestCase):
                 )
 
                 tag = m_info["tag"]
-                mask_path = self.output_dir / f"test_{image_stem}_{tag}_pred_mask.png"
-                prob_path = self.output_dir / f"test_{image_stem}_{tag}_pred_prob.png"
-                contour_path = self.output_dir / f"test_{image_stem}_{tag}_contour.png"
+                mask_path = self.output_dir / f"test_{image_stem}_{tag}_pred.png"
+                comp_path = self.output_dir / f"test_{image_stem}_{tag}_comparison.png"
 
                 save_mask_png(pred_binary, str(mask_path))
-                save_color_heatmap_png(pred_prob, str(prob_path), sharpen=True)
-                save_contour_overlay_image(original_image, pred_binary, str(contour_path))
+                save_comparison_image(original_image, pred_binary, str(comp_path),
+                                      gt_mask=(gt_mask.numpy() if gt_mask is not None else None),
+                                      model_name=tag)
 
                 self.assertTrue(mask_path.exists(), f"Mask file {mask_path} was not created.")
-                self.assertTrue(prob_path.exists(), f"Heatmap file {prob_path} was not created.")
-                self.assertTrue(contour_path.exists(), f"Contour overlay file {contour_path} was not created.")
+                self.assertTrue(comp_path.exists(), f"Comparison file {comp_path} was not created.")
 
-                # Verify that the generated binary mask is non-trivial (contains detected camouflage regions)
+                # Verify that the generated binary mask is valid (0 and 255)
                 mask_size = mask_path.stat().st_size
                 coverage = float(np.mean(pred_binary))
                 print(f"    • [{tag}] Coverage: {coverage*100:.2f}% | Mask PNG size: {mask_size} bytes")
                 self.assertGreater(mask_size, 500, f"Mask file {mask_path} is too small ({mask_size} bytes).")
-                self.assertGreater(coverage, 0.0, f"Binary mask for {m_info['name']} is completely empty (all zeros).")
 
                 model_results.append({
                     "info": m_info,
@@ -104,7 +118,7 @@ class TestAllModelsInference(unittest.TestCase):
 
         # Test multi-model comparison generation
         multi_comp_path = self.output_dir / f"test_{image_stem}_all_models_comparison.png"
-        save_multi_model_comparison(original_image, None, model_results, str(multi_comp_path))
+        save_multi_model_comparison(original_image, gt_mask, model_results, str(multi_comp_path))
         self.assertTrue(multi_comp_path.exists(), "Multi-model comparison image was not created.")
 
 

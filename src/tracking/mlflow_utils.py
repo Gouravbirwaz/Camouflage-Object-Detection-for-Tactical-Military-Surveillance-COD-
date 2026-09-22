@@ -82,7 +82,14 @@ class MLflowTracker:
         tracking_uri: Optional[str] = None,
         artifact_location: Optional[str] = None,
         enabled: Optional[bool] = None,
+        log_dir: Optional[str] = None,
+        *args,
+        **kwargs
     ):
+        # Backward compatibility: older notebooks/scripts pass log_dir=...
+        if log_dir is not None:
+            os.environ.setdefault("LOG_DIR", str(log_dir))
+
         # Configure Hugging Face S3 Gateway (s3.hf.co) for boto3 / MLflow artifact storage
         hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
         if hf_token:

@@ -188,50 +188,57 @@ def save_contour_overlay_image(original: np.ndarray, pred_mask: np.ndarray, outp
 
 def save_comparison_image(original: np.ndarray, pred_mask: np.ndarray, output_path: str,
                           gt_mask: np.ndarray = None, image_size: tuple = (384, 384),
-                          prob_mask: np.ndarray = None):
+                          model_name: str = "PREDICTION", **kwargs):
     """
-    Creates and saves a side-by-side comparison image:
-    [Original | GT Mask (if present) | Binary Mask | Heatmap | Overlay]
+    Creates and saves a clean, uncolorized black-and-white comparison:
+    [ GROUND TRUTH | MODEL: {model_name} ]
+    NO colormap, NO heatmap, NO contour overlay, NO color tints. Pure grayscale binary (0/255).
     """
-    orig_resized = tf.image.resize(original, image_size).numpy().astype(np.uint8)
+    h, w = image_size
 
-    if pred_mask.ndim == 2:
-        pred_mask = pred_mask[:, :, np.newaxis]
-    pred_vis = np.repeat((pred_mask * 255).astype(np.uint8), 3, axis=-1)
+    # Prepare Predicted binary mask [H, W] uint8
+    if hasattr(pred_mask, "numpy"):
+        pred_mask = pred_mask.numpy()
+    if pred_mask.ndim == 3:
+        pred_mask = pred_mask[:, :, 0]
+    pred_u8 = (pred_mask > 0.5 if pred_mask.max() <= 1.0 else pred_mask >= 128).astype(np.uint8) * 255
+    if pred_u8.shape[:2] != (h, w) and HAS_CV2:
+        pred_u8 = cv2.resize(pred_u8, (w, h), interpolation=cv2.INTER_NEAREST)
 
-    # Overlay
-    overlay = orig_resized.copy().astype(np.float32)
-    mask_bool = pred_mask[:, :, 0] > 0.5
-    overlay[mask_bool, 0] = np.clip(overlay[mask_bool, 0] * 0.4 + 150, 0, 255)  # Red tint
-    overlay[mask_bool, 1] = overlay[mask_bool, 1] * 0.6
-    overlay[mask_bool, 2] = overlay[mask_bool, 2] * 0.6
-    overlay = overlay.astype(np.uint8)
-
-    panels = [orig_resized]
-
+    # Prepare GT mask [H, W] uint8
     if gt_mask is not None:
-        if gt_mask.ndim == 2:
-            gt_mask = gt_mask[:, :, np.newaxis]
-        gt_vis = np.repeat((gt_mask * 255).astype(np.uint8), 3, axis=-1)
-        panels.append(gt_vis)
+        if hasattr(gt_mask, "numpy"):
+            gt_mask = gt_mask.numpy()
+        if gt_mask.ndim == 3:
+            gt_mask = gt_mask[:, :, 0]
+        gt_u8 = (gt_mask > 0.5 if gt_mask.max() <= 1.0 else gt_mask >= 128).astype(np.uint8) * 255
+        if gt_u8.shape[:2] != (h, w) and HAS_CV2:
+            gt_u8 = cv2.resize(gt_u8, (w, h), interpolation=cv2.INTER_NEAREST)
+    else:
+        gt_u8 = np.zeros((h, w), dtype=np.uint8)
 
-    panels.append(pred_vis)
+    # 4-pixel vertical divider
+    sep_width = 4
+    separator = np.full((h, sep_width), 128, dtype=np.uint8)
 
-    if prob_mask is not None:
-        if prob_mask.ndim == 3:
-            prob_mask = prob_mask[:, :, 0]
-        prob_u8 = (np.clip(prob_mask, 0.0, 1.0) * 255).astype(np.uint8)
-        if HAS_CV2:
-            hm_bgr = cv2.applyColorMap(prob_u8, cv2.COLORMAP_JET)
-            hm_rgb = cv2.cvtColor(hm_bgr, cv2.COLOR_BGR2RGB)
-        else:
-            hm_rgb = np.stack([prob_u8, prob_u8, 255 - prob_u8], axis=-1)
-        panels.append(hm_rgb)
+    body = np.hstack([gt_u8, separator, pred_u8])
 
-    panels.append(overlay)
+    # Header bar with clear labels
+    header_h = 36
+    header = np.zeros((header_h, body.shape[1]), dtype=np.uint8)
+    if HAS_CV2:
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        thickness = 1
+        cv2.putText(header, "GROUND TRUTH", (15, 24), font, font_scale, 255, thickness, cv2.LINE_AA)
+        label_text = f"MODEL: {model_name}"
+        right_x = w + sep_width + 15
+        cv2.putText(header, label_text, (right_x, 24), font, font_scale, 255, thickness, cv2.LINE_AA)
 
-    comparison = np.concatenate(panels, axis=1)
-    encoded = tf.image.encode_png(comparison)
+    h_div = np.full((2, body.shape[1]), 128, dtype=np.uint8)
+    combined = np.vstack([header, h_div, body])
+
+    encoded = tf.image.encode_png(tf.expand_dims(combined, -1))
     tf.io.write_file(output_path, encoded)
 
 
@@ -240,28 +247,72 @@ def save_multi_model_comparison(original: np.ndarray, gt_mask: np.ndarray,
                                 image_size: tuple = (384, 384)):
     """
     Creates a consolidated side-by-side comparison grid placing output masks of ALL models together:
-    [Original RGB | Ground Truth | Model 1 Mask | Model 2 Mask | ... | Best Heatmap]
+    [ GROUND TRUTH | MODEL 1 | MODEL 2 | ... ]
+    Pure black-and-white (grayscale binary). NO colormap, NO heatmap, NO overlay.
     """
-    orig_resized = tf.image.resize(original, image_size).numpy().astype(np.uint8)
-    panels = [orig_resized]
+    h, w = image_size
+    panels = []
+    headers = []
 
+    # 1. Ground Truth
     if gt_mask is not None:
         gt_np = gt_mask.numpy() if hasattr(gt_mask, "numpy") else gt_mask
-        if gt_np.ndim == 2:
-            gt_np = gt_np[:, :, np.newaxis]
-        gt_vis = np.repeat((gt_np * 255).astype(np.uint8), 3, axis=-1)
-        panels.append(gt_vis)
+        if gt_np.ndim == 3:
+            gt_np = gt_np[:, :, 0]
+        gt_u8 = (gt_np > 0.5 if gt_np.max() <= 1.0 else gt_np >= 128).astype(np.uint8) * 255
+    else:
+        gt_u8 = np.zeros((h, w), dtype=np.uint8)
 
+    if gt_u8.shape[:2] != (h, w) and HAS_CV2:
+        gt_u8 = cv2.resize(gt_u8, (w, h), interpolation=cv2.INTER_NEAREST)
+
+    panels.append(gt_u8)
+    headers.append("GROUND TRUTH")
+
+    # 2. Each Model's Binary Prediction Mask
     for res in model_results:
         p_mask = res["binary_mask"]
-        if p_mask.ndim == 2:
-            p_mask = p_mask[:, :, np.newaxis]
-        m_vis = np.repeat((p_mask * 255).astype(np.uint8), 3, axis=-1)
-        panels.append(m_vis)
+        if hasattr(p_mask, "numpy"):
+            p_mask = p_mask.numpy()
+        if p_mask.ndim == 3:
+            p_mask = p_mask[:, :, 0]
+        p_u8 = (p_mask > 0.5 if p_mask.max() <= 1.0 else p_mask >= 128).astype(np.uint8) * 255
+        if p_u8.shape[:2] != (h, w) and HAS_CV2:
+            p_u8 = cv2.resize(p_u8, (w, h), interpolation=cv2.INTER_NEAREST)
 
-    comparison = np.concatenate(panels, axis=1)
-    encoded = tf.image.encode_png(comparison)
+        panels.append(p_u8)
+        tag = res.get("tag", res.get("name", "Model"))
+        headers.append(tag)
+
+    sep_width = 4
+    separator = np.full((h, sep_width), 128, dtype=np.uint8)
+
+    interleaved_panels = []
+    for idx, p in enumerate(panels):
+        interleaved_panels.append(p)
+        if idx < len(panels) - 1:
+            interleaved_panels.append(separator)
+
+    body = np.hstack(interleaved_panels)
+
+    header_h = 36
+    header = np.zeros((header_h, body.shape[1]), dtype=np.uint8)
+    if HAS_CV2:
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.45
+        thickness = 1
+        current_x = 0
+        for idx, title in enumerate(headers):
+            text_x = current_x + 10
+            cv2.putText(header, str(title), (text_x, 24), font, font_scale, 255, thickness, cv2.LINE_AA)
+            current_x += w + sep_width
+
+    h_div = np.full((2, body.shape[1]), 128, dtype=np.uint8)
+    combined = np.vstack([header, h_div, body])
+
+    encoded = tf.image.encode_png(tf.expand_dims(combined, -1))
     tf.io.write_file(output_path, encoded)
+
 
 
 def find_default_sample_images() -> list:
@@ -346,7 +397,7 @@ def discover_all_models(models_dir: Path = None) -> list:
                 elif name_lower.endswith(".onnx"):
                     model_type = "onnx"
 
-                tag = f"{parent_folder}_{stem}"
+                tag = stem
 
                 model_entries.append({
                     "path": str(path.resolve()),
@@ -463,16 +514,16 @@ def generate_html_visual_report(image_stem: str, model_results: list, output_dir
             <p class="meta">Backbone: <strong>{html.escape(res['backbone'])}</strong> | Type: <strong>{html.escape(res['model_type'])}</strong> | Inference: <strong>{res['inference_time_ms']:.1f} ms</strong></p>
             <div class="image-trio">
                 <div>
-                    <img src="{image_stem}_{tag}_pred_mask.png" alt="Binary Mask">
-                    <p class="img-lbl">Binary Mask (Threshold {res['threshold']})</p>
+                    <img src="{image_stem}_gt.png" alt="Ground Truth">
+                    <p class="img-lbl">Ground Truth (GT)</p>
                 </div>
                 <div>
-                    <img src="{image_stem}_{tag}_pred_prob.png" alt="Probability Heatmap">
-                    <p class="img-lbl">Color Probability Heatmap</p>
+                    <img src="{image_stem}_{tag}_pred.png" alt="Binary Mask">
+                    <p class="img-lbl">Predicted Mask ({html.escape(tag)})</p>
                 </div>
                 <div>
-                    <img src="{image_stem}_{tag}_contour.png" alt="Contour Overlay">
-                    <p class="img-lbl">Contour Overlay</p>
+                    <img src="{image_stem}_{tag}_comparison.png" alt="Comparison">
+                    <p class="img-lbl">Comparison [GT | {html.escape(tag)}]</p>
                 </div>
             </div>
             {metrics_html}
@@ -533,6 +584,7 @@ def main():
     parser = argparse.ArgumentParser(description="DGNet Multi-Model Visual Inference Test Suite")
     parser.add_argument("--image", type=str, default=None, help="Path to input RGB image")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to specific model weights")
+    parser.add_argument("--model-tag", "--model-name", type=str, default=None, help="Custom model tag or name for output filenames")
     parser.add_argument("--all-models", action="store_true", help="Auto-discover and test all models in models/ directory")
     parser.add_argument("--backbone", type=str, default=None, help="Backbone architecture")
     parser.add_argument("--threshold", type=float, default=0.5, help="Binarization threshold (default: 0.5)")
@@ -560,12 +612,14 @@ def main():
     # Discover models
     if args.checkpoint:
         ckpt_path = Path(args.checkpoint).resolve()
+        ckpt_stem = ckpt_path.name.replace(".weights.h5", "").replace(".keras", "").replace(".h5", "").replace(".tflite", "").replace(".onnx", "")
+        tag = args.model_tag or ckpt_stem
         models_to_test = [{
             "path": str(ckpt_path),
             "name": ckpt_path.name,
-            "tag": "custom_checkpoint",
+            "tag": tag,
             "parent_folder": ckpt_path.parent.name,
-            "model_type": "keras",
+            "model_type": "keras" if not ckpt_path.name.endswith((".tflite", ".onnx")) else ("tflite" if ckpt_path.name.endswith(".tflite") else "onnx"),
             "backbone": args.backbone or "mobilenet_v3_large"
         }]
     else:
@@ -633,19 +687,23 @@ def main():
 
                 tag = m_info["tag"]
 
-                # Save individual outputs
-                mask_path = output_dir / f"{image_stem}_{tag}_pred_mask.png"
-                prob_path = output_dir / f"{image_stem}_{tag}_pred_prob.png"
-                contour_path = output_dir / f"{image_stem}_{tag}_contour.png"
-                comp_path = output_dir / f"{image_stem}_{tag}_comparison.png"
+                # 1. Save clean Ground Truth mask (pure binary 0/255)
+                if gt_mask is not None:
+                    gt_out = output_dir / f"{image_stem}_gt.png"
+                    if not gt_out.exists():
+                        save_mask_png(gt_mask, str(gt_out))
 
+                # 2. Save clean binary Prediction mask named with model tag
+                mask_path = output_dir / f"{image_stem}_{tag}_pred.png"
                 save_mask_png(pred_binary, str(mask_path))
-                save_color_heatmap_png(pred_prob_np, str(prob_path))
-                save_contour_overlay_image(original_image, pred_binary, str(contour_path), image_size=img_size)
+                # Compatibility symlink/alias
+                save_mask_png(pred_binary, str(output_dir / f"{image_stem}_{tag}_pred_mask.png"))
 
+                # 3. Save clean Black-and-White comparison [GROUND TRUTH | MODEL: {tag}]
+                comp_path = output_dir / f"{image_stem}_{tag}_comparison.png"
                 gt_for_vis = gt_mask.numpy() if gt_mask is not None else None
                 save_comparison_image(original_image, pred_binary, str(comp_path),
-                                      gt_mask=gt_for_vis, image_size=img_size, prob_mask=pred_prob_np)
+                                      gt_mask=gt_for_vis, image_size=img_size, model_name=tag)
 
                 # Compute metrics if GT exists
                 metrics = {}
@@ -681,10 +739,9 @@ def main():
 
             # Also save default fallback filenames for backwards compatibility
             first_res = model_results[0]
-            save_mask_png(first_res["pred_prob"], str(output_dir / f"{image_stem}_pred_prob.png"))
-            save_mask_png(first_res["binary_mask"], str(output_dir / f"{image_stem}_pred_mask.png"))
+            save_mask_png(first_res["binary_mask"], str(output_dir / f"{image_stem}_pred.png"))
             save_comparison_image(original_image, first_res["binary_mask"], str(output_dir / f"{image_stem}_comparison.png"),
-                                  gt_mask=(gt_mask.numpy() if gt_mask is not None else None), image_size=img_size, prob_mask=first_res["pred_prob"])
+                                  gt_mask=(gt_mask.numpy() if gt_mask is not None else None), image_size=img_size, model_name=first_res["tag"])
 
             # Generate HTML Visual Report
             generate_html_visual_report(image_stem, model_results, output_dir, gt_path=gt_path)

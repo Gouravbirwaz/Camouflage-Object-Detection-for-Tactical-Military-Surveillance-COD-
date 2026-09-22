@@ -29,6 +29,8 @@ import shutil
 import sys
 from pathlib import Path
 
+
+
 # Load .env file if available
 try:
     from dotenv import load_dotenv
@@ -120,8 +122,13 @@ def upload_checkpoints(ckpt_dir: str = None):
             for file in dir_path.rglob("*"):
                 if file.is_file() and not file.name.startswith("."):
                     if file.suffix.lower() in valid_exts or "weights" in file.name or "dgnet" in file.name:
-                        # Determine path in repo based on subfolder (quantized vs raw_checkpoints)
-                        subfolder = "quantized" if "quantized" in str(file.parent).lower() else "raw_checkpoints"
+                        # Strictly route .tflite, .onnx, .engine to quantized folder
+                        is_quantized = (
+                            file.suffix.lower() in {".tflite", ".onnx", ".engine"}
+                            or "quantized" in str(file.parent).lower()
+                            or "int8" in file.name.lower()
+                        )
+                        subfolder = "quantized" if is_quantized else "raw_checkpoints"
                         files_to_upload[f"{subfolder}/{file.name}"] = (file, subfolder)
         except Exception:
             continue
@@ -170,30 +177,61 @@ def upload_checkpoints(ckpt_dir: str = None):
     print("[HF Sync] Checkpoint upload completed successfully!\n")
 
 
-def download_checkpoints(ckpt_dir: str = None):
+def download_checkpoints(ckpt_dir: str = None, recent_only: bool = False):
     if ckpt_dir is None:
         ckpt_dir = os.getenv("CHECKPOINT_DIR", train_cfg.get("checkpoint_dir", "models/raw_checkpoints"))
 
     primary_path = _resolve_path(ckpt_dir)
     primary_path.mkdir(parents=True, exist_ok=True)
 
+    quantized_path = PROJECT_ROOT / "models/quantized"
+    quantized_path.mkdir(parents=True, exist_ok=True)
+
     fallback_path = PROJECT_ROOT / "models/raw_checkpoints"
     fallback_path.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n[HF Sync] Downloading latest checkpoints from repo '{REPO_ID}' to {primary_path.resolve()}...")
+    print(f"\n[HF Sync] Downloading latest checkpoints and weights from repo '{REPO_ID}'...")
     api = get_api()
 
     try:
         files = api.list_repo_files(repo_id=REPO_ID, repo_type="dataset", token=HF_TOKEN)
-        ckpt_files = [f for f in files if f.startswith("models/raw_checkpoints/")]
+        valid_exts = {".h5", ".keras", ".tflite", ".json", ".pt", ".onnx", ".engine", ".ckpt"}
+        
+        # Match all checkpoint & model files in remote repository
+        ckpt_files = [
+            f for f in files
+            if (f.startswith("models/") or f.startswith("checkpoints/"))
+            and any(f.lower().endswith(ext) for ext in valid_exts)
+        ]
 
         if not ckpt_files:
             print("[HF Sync] No checkpoints found in remote repository.")
             return
 
-        for remote_file in ckpt_files:
+        if recent_only:
+            # Filter for latest, best, quantized, and most recent 3 epoch checkpoints
+            priority_keywords = ["best", "latest", "final", "int8", "quantized"]
+            filtered = [f for f in ckpt_files if any(k in f.lower() for k in priority_keywords)]
+            epoch_files = sorted([f for f in ckpt_files if "epoch" in f.lower()])
+            if epoch_files:
+                filtered.extend(epoch_files[-3:])
+            ckpt_files = sorted(list(set(filtered)))
+
+        print(f"[HF Sync] Found {len(ckpt_files)} remote checkpoint/model file(s):")
+        downloaded_count = 0
+
+        for remote_file in sorted(ckpt_files):
             filename = Path(remote_file).name
-            print(f"  • Downloading {filename}...")
+            is_quantized = (
+                filename.lower().endswith((".tflite", ".onnx", ".engine"))
+                or "quantized" in remote_file.lower()
+                or "int8" in filename.lower()
+            )
+            subfolder = "quantized" if is_quantized else "raw_checkpoints"
+            target_dir = quantized_path if is_quantized else primary_path
+            target_file = target_dir / filename
+
+            print(f"  • [{subfolder}] Downloading {filename}...")
             downloaded_path_str = hf_hub_download(
                 repo_id=REPO_ID,
                 repo_type="dataset",
@@ -203,17 +241,33 @@ def download_checkpoints(ckpt_dir: str = None):
             )
             downloaded_file = Path(downloaded_path_str)
 
-            # Copy to primary_path if different
-            target_file = primary_path / filename
+            # Ensure copy exists in target directory
             if downloaded_file.resolve() != target_file.resolve():
                 shutil.copy2(str(downloaded_file), str(target_file))
 
-            # Also ensure copy exists in fallback_path
-            fb_target = fallback_path / filename
-            if downloaded_file.resolve() != fb_target.resolve() and not fb_target.exists():
-                shutil.copy2(str(downloaded_file), str(fb_target))
+            # If it's a quantized file (.tflite, etc.), remove any duplicates from models/ or models/raw_checkpoints/
+            if is_quantized:
+                for stray in [
+                    PROJECT_ROOT / "models" / filename,
+                    primary_path / filename,
+                    fallback_path / filename,
+                    PROJECT_ROOT / "models/raw_checkpoints" / filename
+                ]:
+                    if stray.resolve() != target_file.resolve() and stray.exists():
+                        try:
+                            stray.unlink()
+                        except Exception:
+                            pass
+            else:
+                # Also ensure raw_checkpoints has copy of fallback for non-quantized weights
+                if fallback_path.resolve() != target_dir.resolve():
+                    fb_target = fallback_path / filename
+                    if not fb_target.exists():
+                        shutil.copy2(str(downloaded_file), str(fb_target))
 
-        print("[HF Sync] Checkpoints downloaded successfully!\n")
+            downloaded_count += 1
+
+        print(f"[HF Sync] SUCCESS: {downloaded_count} checkpoint and weight file(s) downloaded to {primary_path.resolve()}.\n")
     except Exception as e:
         print(f"[HF Sync] Checkpoint download notice: {e}")
 
@@ -281,8 +335,10 @@ def download_logs(log_dir: str = None):
 
     primary_path = _resolve_path(log_dir)
     primary_path.mkdir(parents=True, exist_ok=True)
+    db_dir = primary_path / "mlflow_db"
+    db_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n[HF Sync] Downloading latest training logs & MLflow metrics from repo '{REPO_ID}' to {primary_path.resolve()}...")
+    print(f"\n[HF Sync] Downloading latest training logs & MLflow metrics from repo '{REPO_ID}'...")
     try:
         snapshot_download(
             repo_id=REPO_ID,
@@ -291,6 +347,22 @@ def download_logs(log_dir: str = None):
             allow_patterns=["metrics/*", "metrics/**", "logs/*", "logs/**"],
             token=HF_TOKEN
         )
+
+        # Fallback: direct download of mlflow.db if snapshot missed it
+        db_file = db_dir / "mlflow.db"
+        try:
+            downloaded_db = hf_hub_download(
+                repo_id=REPO_ID,
+                repo_type="dataset",
+                filename="metrics/mlflow_db/mlflow.db",
+                local_dir=str(PROJECT_ROOT),
+                token=HF_TOKEN
+            )
+            if Path(downloaded_db).resolve() != db_file.resolve():
+                shutil.copy2(downloaded_db, str(db_file))
+        except Exception:
+            pass
+
         # If downloaded into logs/, copy/move to metrics/
         logs_downloaded = PROJECT_ROOT / "logs"
         if logs_downloaded.exists() and logs_downloaded.resolve() != primary_path.resolve():
@@ -301,8 +373,7 @@ def download_logs(log_dir: str = None):
                 else:
                     shutil.copy2(str(item), str(target))
 
-        # Check and fix sqlite alembic schema for MLflow 3.x compatibility
-        db_file = primary_path / "mlflow_db" / "mlflow.db"
+        # Check and fix sqlite alembic schema for MLflow 3.x compatibility & print summary
         if db_file.exists():
             try:
                 import sqlite3
@@ -313,11 +384,31 @@ def download_logs(log_dir: str = None):
                     if ver and ver[0] == 'b7e2c1a4d9f3':
                         conn.execute("UPDATE alembic_version SET version_num = '1b5f0d9ad7c1'")
                         conn.commit()
+
+                if 'runs' in tables:
+                    runs = conn.execute("SELECT run_uuid, status, start_time, end_time FROM runs ORDER BY start_time DESC").fetchall()
+                    metric_count = conn.execute("SELECT COUNT(*) FROM metrics").fetchone()[0] if 'metrics' in tables else 0
+                    print(f"  • MLflow DB Verified: {len(runs)} total run(s), {metric_count} logged metric entries.")
+                    if runs:
+                        latest_run = runs[0]
+                        print(f"  • Latest Run ID: {latest_run[0]} (Status: {latest_run[1]})")
                 conn.close()
+            except Exception as sql_err:
+                print(f"  • Note (SQLite inspect): {sql_err}")
+
+        # Check latest train_metrics.json
+        json_file = primary_path / "train_metrics.json"
+        if json_file.exists():
+            try:
+                with open(json_file, "r") as f:
+                    metrics_data = json.load(f)
+                if "final_summary" in metrics_data:
+                    fs = metrics_data["final_summary"]
+                    print(f"  • Training Summary: Best IoU: {fs.get('best_val_iou', 'N/A')} | Best Val Loss: {fs.get('best_val_loss', 'N/A')} | Epochs: {fs.get('total_epochs_run', 'N/A')}")
             except Exception:
                 pass
 
-        print("[HF Sync] Logs & MLflow database downloaded successfully!\n")
+        print(f"[HF Sync] SUCCESS: Logs & MLflow database updated at {primary_path.resolve()}.\n")
     except Exception as e:
         print(f"[HF Sync] Log download notice: {e}")
 
@@ -434,8 +525,10 @@ def main():
     env_ckpt_dir = os.getenv("CHECKPOINT_DIR", train_cfg.get("checkpoint_dir", "models/raw_checkpoints"))
     env_log_dir = os.getenv("LOG_DIR", train_cfg.get("log_dir", "metrics"))
 
-
     parser = argparse.ArgumentParser(description="Hugging Face Storage Bucket Synchronization Helper")
+    parser.add_argument("--pull", "--download-all", action="store_true", help="Download latest MLflow DB, training metrics logs, and model checkpoints in one command")
+    parser.add_argument("--push", "--upload-all", action="store_true", help="Upload local model checkpoints and logs/MLflow DB to HF repo")
+    parser.add_argument("--recent-only", action="store_true", help="Download only latest, best, and most recent checkpoints (skips older epoch checkpoints)")
     parser.add_argument("--upload-checkpoints", action="store_true", help="Upload local model checkpoints to HF Storage Bucket")
     parser.add_argument("--download-checkpoints", action="store_true", help="Download remote model checkpoints from HF Storage Bucket")
     parser.add_argument("--upload-logs", action="store_true", help="Upload training/evaluation metrics logs to HF Storage Bucket")
@@ -449,8 +542,34 @@ def main():
 
     args = parser.parse_args()
 
-    if not any([args.upload_checkpoints, args.download_checkpoints, args.upload_logs, args.download_logs, args.upload_dataset, args.download_dataset, args.sync_all]):
-        parser.print_help()
+    # Unified Pull: Download both logs (MLflow DB) and checkpoints
+    if args.pull:
+        print("\n" + "=" * 70)
+        print(f"  HF Sync: Pulling Latest Logs, MLflow DB & Checkpoints from '{REPO_ID}'")
+        print("=" * 70)
+        download_logs(args.log_dir)
+        download_checkpoints(args.ckpt_dir, recent_only=args.recent_only)
+        print("=" * 70)
+        print("  SUCCESS: Remote sync complete! To view MLflow runs locally:")
+        print("    mlflow ui --backend-store-uri metrics/mlflow_db/mlflow.db")
+        print("=" * 70 + "\n")
+        return
+
+    # Unified Push: Upload checkpoints and logs
+    if args.push:
+        print("\n" + "=" * 70)
+        print(f"  HF Sync: Uploading Checkpoints & Logs to '{REPO_ID}'")
+        print("=" * 70)
+        upload_checkpoints(args.ckpt_dir)
+        upload_logs(args.log_dir)
+        print("=" * 70 + "\n")
+        return
+
+    if not any([args.upload_checkpoints, args.download_checkpoints, args.upload_logs, args.download_logs, args.upload_dataset, args.download_dataset, args.sync_all, args.pull, args.push]):
+        # Default behavior: run pull
+        print("\n[HF Sync] No specific flag provided. Pulling latest MLflow DB, logs, and checkpoints...")
+        download_logs(args.log_dir)
+        download_checkpoints(args.ckpt_dir, recent_only=args.recent_only)
         return
 
     if args.sync_all or args.upload_checkpoints:
@@ -466,7 +585,7 @@ def main():
         upload_dataset(args.data_dir)
 
     if args.download_checkpoints:
-        download_checkpoints(args.ckpt_dir)
+        download_checkpoints(args.ckpt_dir, recent_only=args.recent_only)
 
     if args.download_dataset:
         download_dataset(args.data_dir)

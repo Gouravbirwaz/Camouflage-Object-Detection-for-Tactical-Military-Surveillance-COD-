@@ -460,10 +460,24 @@ class DGNetLoss(losses.Loss):
                  + lambda_grad * MSE(grad_pred, grad_gt)
     """
 
-    def __init__(self, lambda_grad_loss: float = 1.0, label_smoothing: float = 0.02, name: str = "dgnet_loss", **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.lambda_grad_loss = lambda_grad_loss
-        self.label_smoothing = label_smoothing
+    def __init__(
+        self,
+        lambda_grad_loss: float = 1.0,
+        label_smoothing: float = 0.02,
+        deep_supervision: bool = True,
+        grad_loss_weight: float = None,
+        name: str = "dgnet_loss",
+        **kwargs,
+    ):
+        if grad_loss_weight is not None:
+            lambda_grad_loss = grad_loss_weight
+        if "lambda_grad" in kwargs:
+            lambda_grad_loss = kwargs.get("lambda_grad")
+
+        super().__init__(name=name)
+        self.lambda_grad_loss = float(lambda_grad_loss)
+        self.label_smoothing = float(label_smoothing)
+        self.deep_supervision = bool(deep_supervision)
         # 3x3 Laplacian kernel for edge detection
         self.laplacian_kernel = tf.constant([[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]], dtype=tf.float32)
         self.laplacian_kernel = tf.reshape(self.laplacian_kernel, [3, 3, 1, 1])

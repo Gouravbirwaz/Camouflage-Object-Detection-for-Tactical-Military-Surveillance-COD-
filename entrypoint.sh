@@ -81,11 +81,29 @@ echo ""
 echo "[Step 1/3] Syncing latest checkpoints and dataset from HF Storage Bucket..."
 echo "[Step 1/3] Syncing dataset and checkpoints from Hugging Face..." > /tmp/training_status.txt
 
+# Configure DVC credentials if HF_TOKEN is present
+if [ -n "$HF_TOKEN" ]; then
+    dvc remote modify --local hf-bucket access_key_id hf 2>/dev/null || true
+    dvc remote modify --local hf-bucket secret_access_key "$HF_TOKEN" 2>/dev/null || true
+fi
+
 if [ -d "/data/dvc-store" ] || [ -d "/data/files" ]; then
     echo "  • Detected mounted DVC storage bucket at /data. Running DVC checkout..."
     dvc config cache.dir /data/dvc-store 2>/dev/null || true
     dvc config cache.type copy 2>/dev/null || true
-    dvc checkout data/raw.dvc 2>/dev/null || dvc checkout 2>/dev/null || echo "Notice: DVC checkout completed with notes."
+    dvc checkout data/raw.dvc 2>/dev/null || true
+    dvc checkout data/augmented.dvc 2>/dev/null || true
+    dvc checkout 2>/dev/null || echo "Notice: DVC checkout completed with notes."
+else
+    # Pull missing datasets from S3/HF remote if not cached locally
+    if [ ! -d "data/raw/dataset-splitM" ] && [ ! -d "data/raw/Training" ]; then
+        echo "  • Pulling raw dataset via DVC from remote..."
+        dvc pull data/raw.dvc 2>/dev/null || true
+    fi
+    if [ ! -d "data/augmented/military_tactical" ] && [ ! -d "data/augmented/Training" ]; then
+        echo "  • Pulling augmented dataset via DVC from remote..."
+        dvc pull data/augmented.dvc 2>/dev/null || true
+    fi
 fi
 
 python3 scripts/hf_sync.py --download-checkpoints --ckpt-dir "$CKPT_DIR_RESOLVED" --download-dataset --download-logs --log-dir "$LOG_DIR_RESOLVED" || echo "Notice: Checkpoint/dataset/logs sync skipped or using mounted S3 dataset."
@@ -99,10 +117,12 @@ echo "[Step 2/3] Preparing dataset & DGNet GPU Training in progress (Epochs: ${E
 echo "[GT Prep] Running GT mask conversion (JPEG to PNG)..."
 python3 scripts/convert_gt_to_png.py --data-dir ${DATA_DIR:-data/raw/dataset-splitM} || echo "Notice: GT mask conversion completed or skipped."
 
-# Generate military tactical augmented dataset if not already present
-if [ ! -d "data/augmented/military_tactical/Training/images" ] && [ ! -d "/data/augmented/military_tactical/Training/images" ]; then
-    echo "[Data Prep] Generating military tactical augmented dataset (4x multiplier)..."
+# Generate military tactical augmented dataset only if not already restored from DVC/S3
+if [ ! -d "data/augmented/military_tactical/Training/images" ] && [ ! -d "/data/augmented/military_tactical/Training/images" ] && [ ! -d "data/augmented/Training/images" ] && [ ! -d "/data/augmented/Training/images" ]; then
+    echo "[Data Prep] No existing augmented dataset found in DVC/S3. Generating military tactical augmented dataset (4x multiplier)..."
     python3 scripts/generate_augmented_dataset.py --raw-dir ${DATA_DIR:-data/raw/dataset-splitM} --multiplier 4 || echo "Notice: Augmented dataset generation completed or skipped."
+else
+    echo "[Data Prep] Augmented military tactical dataset detected from DVC/S3. Ready for training!"
 fi
 
 RESUME_FLAG=""

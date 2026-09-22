@@ -28,6 +28,10 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import cv2
+# Prevent threadpool contention and deadlock between OpenCV and TensorFlow tf.data workers
+cv2.setNumThreads(0)
+cv2.ocl.setUseOpenCL(False)
+
 import numpy as np
 import tensorflow as tf
 import yaml
@@ -257,7 +261,10 @@ def discover_dataset_pairs(data_dir: Path) -> Dict[str, Tuple[List[str], List[st
             subprocess.run(["dvc", "config", "cache.dir", str(found_dvc_store.resolve())], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.run(["dvc", "config", "cache.type", "copy"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.run(["dvc", "checkout", "data/raw.dvc"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["dvc", "checkout", "data/augmented.dvc"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.run(["dvc", "checkout"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["dvc", "pull", "data/raw.dvc"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["dvc", "pull", "data/augmented.dvc"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             # Re-scan candidate paths after DVC checkout
             for p in unique_candidates:
@@ -313,6 +320,8 @@ def parse_sample(img_path: tf.Tensor, mask_path: tf.Tensor, image_size: Tuple[in
 
     # Return float image in range [0, 1] for augmentation; normalization performed after augmentation
     image_float = tf.cast(image, tf.float32) / 255.0
+    image_float.set_shape([image_size[0], image_size[1], 3])
+    mask_bin.set_shape([image_size[0], image_size[1], 1])
 
     return image_float, mask_bin, grad_gt
 
@@ -417,17 +426,16 @@ def create_tf_dataset(
     batch_size: int = 8,
     is_train: bool = True
 ) -> tf.data.Dataset:
-    """Builds a high-throughput TensorFlow tf.data.Dataset pipeline with RAM caching and aggressive augmentation."""
+    """Builds a high-throughput streaming TensorFlow tf.data.Dataset pipeline with low memory footprint."""
     dataset = tf.data.Dataset.from_tensor_slices((image_paths, mask_paths))
 
     def _map_fn(img_p, mask_p):
         return parse_sample(img_p, mask_p, image_size=image_size)
 
     dataset = dataset.map(_map_fn, num_parallel_calls=tf.data.AUTOTUNE)
-    dataset = dataset.cache()
 
     if is_train:
-        dataset = dataset.shuffle(buffer_size=min(len(image_paths), 1000), seed=42)
+        dataset = dataset.shuffle(buffer_size=min(len(image_paths), 256), seed=42)
 
         def _augment_fn(img, mask, grad_gt):
             # --- Geometric Augmentations (applied to image + mask + grad_gt together) ---
@@ -522,6 +530,7 @@ def train_dgnet(
     batch_size: int = 8,
     learning_rate: float = 0.00005,
     data_dir: str = "data/raw/dataset-splitM",
+    augmented_dir: str = None,
     checkpoint_dir: str = "models/raw_checkpoints",
     log_dir: str = "metrics",
     backbone: str = "mobilenet_v3_large",
@@ -569,12 +578,32 @@ def train_dgnet(
         train_imgs, train_masks = all_imgs[:val_idx], all_masks[:val_idx]
         val_imgs, val_masks = all_imgs[val_idx:], all_masks[val_idx:]
 
-    # 1b. Merge augmented military tactical training data (if available)
-    augmented_dirs = [
+    # 1b. Merge augmented military tactical training data (from local DVC checkout or mounted S3 bucket)
+    augmented_candidates = []
+    if augmented_dir:
+        augmented_candidates.append(Path(augmented_dir) if Path(augmented_dir).is_absolute() else PROJECT_ROOT / augmented_dir)
+        augmented_candidates.append(Path(augmented_dir))
+    augmented_candidates.extend([
         PROJECT_ROOT / "data" / "augmented" / "military_tactical",
+        PROJECT_ROOT / "data" / "augmented",
         Path("/data/augmented/military_tactical"),
-    ]
-    for aug_dir in augmented_dirs:
+        Path("/data/augmented"),
+        Path("/data/data/augmented/military_tactical"),
+        Path("/data/data/augmented"),
+        Path("/mnt/data/augmented/military_tactical"),
+        Path("/mnt/data/augmented"),
+    ])
+
+    seen_aug_dirs = set()
+    for aug_dir in augmented_candidates:
+        try:
+            resolved_aug = str(aug_dir.resolve())
+        except Exception:
+            resolved_aug = str(aug_dir)
+        if resolved_aug in seen_aug_dirs:
+            continue
+        seen_aug_dirs.add(resolved_aug)
+
         try:
             aug_splits = _find_dataset_splits_in_dir(aug_dir, {".jpg", ".jpeg", ".png", ".bmp", ".webp"})
             if aug_splits:
@@ -583,9 +612,9 @@ def train_dgnet(
                         orig_count = len(train_imgs)
                         train_imgs.extend(aug_imgs)
                         train_masks.extend(aug_masks)
-                        print(f"\n[Dataset Merge] Merged {len(aug_imgs)} augmented military tactical samples from: {aug_dir.resolve()}")
-                        print(f"  • Original Training: {orig_count} | Augmented: {len(aug_imgs)} | Combined: {len(train_imgs)}")
-                break  # Use the first augmented directory found
+                        print(f"\n[Dataset Merge] Successfully merged {len(aug_imgs)} augmented military tactical samples from: {aug_dir.resolve()}")
+                        print(f"  • Original Training: {orig_count} | Augmented: {len(aug_imgs)} | Combined Total: {len(train_imgs)}")
+                break  # Use the first valid augmented dataset directory found
         except Exception:
             continue
 
@@ -830,6 +859,12 @@ def train_dgnet(
                 train_loss_sum += loss_val
                 num_batches += 1
                 pbar.set_postfix({"loss": f"{loss_val:.4f}", "avg_loss": f"{train_loss_sum / num_batches:.4f}"})
+                if num_batches % 10 == 0:
+                    global_step = (epoch - 1) * total_train_batches + num_batches
+                    mlflow_tracker.log_metrics({
+                        "batch_train_loss": loss_val,
+                        "running_avg_train_loss": train_loss_sum / num_batches
+                    }, step=global_step)
         else:
             print(f"---> Epoch [{epoch:02d}/{epochs:02d}] Training on {len(train_imgs)} samples...", flush=True)
             for x_batch, y_mask, y_grad in train_ds:
@@ -839,6 +874,12 @@ def train_dgnet(
                 num_batches += 1
                 if num_batches == 1 or num_batches % 5 == 0 or num_batches == total_train_batches:
                     print(f"  Batch [{num_batches:03d}/{total_train_batches:03d}] | Loss: {loss_val:.4f} | Avg Loss: {train_loss_sum / num_batches:.4f}", flush=True)
+                if num_batches % 10 == 0:
+                    global_step = (epoch - 1) * total_train_batches + num_batches
+                    mlflow_tracker.log_metrics({
+                        "batch_train_loss": loss_val,
+                        "running_avg_train_loss": train_loss_sum / num_batches
+                    }, step=global_step)
 
         avg_train_loss = train_loss_sum / num_batches if num_batches > 0 else 0.0
 
@@ -947,12 +988,12 @@ def train_dgnet(
             "val_fnr": epoch_metrics["fnr"],
         }, step=epoch)
 
-        # Periodically upload MLflow database and checkpoints to Hugging Face every 5 epochs
-        if (epoch % 5 == 0 or saved_str or epoch == epochs) and os.getenv("TRAINING_PLATFORM", "huggingface").lower() in ("huggingface", "hf", "true", "1"):
+        # Upload MLflow database and checkpoints to Hugging Face
+        if os.getenv("TRAINING_PLATFORM", "huggingface").lower() in ("huggingface", "hf", "true", "1") or os.getenv("HF_TOKEN"):
             try:
                 from scripts.hf_sync import upload_logs, upload_checkpoints
                 upload_logs()
-                if saved_str:
+                if saved_str or epoch % 5 == 0 or epoch == epochs:
                     upload_checkpoints()
             except Exception as sync_err:
                 pass
@@ -1092,8 +1133,19 @@ def train_dgnet(
             print(f"[HF Sync] Final upload notice: {e}")
 
 
-def evaluate_dgnet(data_dir: str = "data/raw/dataset-splitM", checkpoint_dir: str = "models/raw_checkpoints", log_dir: str = "metrics", backbone: str = "mobilenet_v3_large", kernel: str = "sobel", model_version: str = None):
-    """Evaluates the trained model on test dataset split."""
+def evaluate_dgnet(
+    data_dir: str = "data/raw/dataset-splitM",
+    checkpoint_dir: str = "models/raw_checkpoints",
+    weights_path: str = None,
+    pred_dir: str = "experiments/predictions",
+    log_dir: str = "metrics",
+    backbone: str = "mobilenet_v3_large",
+    kernel: str = "sobel",
+    model_version: str = None,
+    model_tag: str = None,
+    save_predictions: bool = True
+):
+    """Evaluates the trained model on test dataset split and saves clean GT, prediction, and comparison masks."""
     setup_gpu_environment()
 
     params = load_config("params.yaml")
@@ -1107,6 +1159,9 @@ def evaluate_dgnet(data_dir: str = "data/raw/dataset-splitM", checkpoint_dir: st
     ckpt_dir = Path(checkpoint_dir) if Path(checkpoint_dir).is_absolute() else PROJECT_ROOT / checkpoint_dir
     metrics_log_dir = Path(log_dir) if Path(log_dir).is_absolute() else PROJECT_ROOT / log_dir
     metrics_log_dir.mkdir(parents=True, exist_ok=True)
+    pred_path = Path(pred_dir) if Path(pred_dir).is_absolute() else PROJECT_ROOT / pred_dir
+    if save_predictions:
+        pred_path.mkdir(parents=True, exist_ok=True)
 
     splits = discover_dataset_pairs(data_path)
     test_key = "Testing" if "Testing" in splits else list(splits.keys())[0]
@@ -1117,41 +1172,56 @@ def evaluate_dgnet(data_dir: str = "data/raw/dataset-splitM", checkpoint_dir: st
 
     model = build_dgnet_model(backbone_name=backbone, input_shape=(img_size[0], img_size[1], 3), gradient_kernel=kernel, pretrained=False)
 
-    # Multi-candidate search for weights (versioned priority)
-    candidate_dirs = [
-        ckpt_dir,
-        Path("/data/models/raw_checkpoints"),
-        Path("/app/models/raw_checkpoints"),
-        PROJECT_ROOT / "models/raw_checkpoints"
-    ]
+    # Multi-candidate search for weights (or explicit weights_path)
     found_weights = None
-    w_candidates = [
-        f"dgnet_{version_tag}_best.weights.h5",
-        f"dgnet_{version_tag}_latest.weights.h5",
-        f"dgnet_{version_tag}_final.weights.h5",
-        "dgnet_best.weights.h5",
-        "dgnet_latest.weights.h5",
-        "dgnet_final.weights.h5"
-    ]
-    for cdir in candidate_dirs:
-        try:
-            if not cdir.exists():
+    if weights_path:
+        wp = Path(weights_path) if Path(weights_path).is_absolute() else PROJECT_ROOT / weights_path
+        if wp.exists() and wp.is_file() and wp.stat().st_size > 0:
+            found_weights = wp
+        else:
+            print(f"[Evaluation] Specified weights file not found: {wp}")
+
+    if not found_weights:
+        candidate_dirs = [
+            ckpt_dir,
+            Path("/data/models/raw_checkpoints"),
+            Path("/app/models/raw_checkpoints"),
+            PROJECT_ROOT / "models/raw_checkpoints"
+        ]
+        w_candidates = [
+            f"dgnet_{version_tag}_best.weights.h5",
+            f"dgnet_{version_tag}_latest.weights.h5",
+            f"dgnet_{version_tag}_final.weights.h5",
+            "dgnet_best.weights.h5",
+            "dgnet_latest.weights.h5",
+            "dgnet_final.weights.h5"
+        ]
+        for cdir in candidate_dirs:
+            try:
+                if not cdir.exists():
+                    continue
+                for w_name in w_candidates:
+                    wp = cdir / w_name
+                    if wp.exists() and wp.stat().st_size > 0:
+                        found_weights = wp
+                        break
+                if found_weights:
+                    break
+                for wp in sorted(cdir.glob("*.weights.h5"), reverse=True):
+                    if wp.is_file() and wp.stat().st_size > 0:
+                        found_weights = wp
+                        break
+                if found_weights:
+                    break
+            except Exception:
                 continue
-            for w_name in w_candidates:
-                wp = cdir / w_name
-                if wp.exists() and wp.stat().st_size > 0:
-                    found_weights = wp
-                    break
-            if found_weights:
-                break
-            for wp in sorted(cdir.glob("*.weights.h5"), reverse=True):
-                if wp.is_file() and wp.stat().st_size > 0:
-                    found_weights = wp
-                    break
-            if found_weights:
-                break
-        except Exception:
-            continue
+
+    if model_tag:
+        effective_model_tag = model_tag
+    elif found_weights:
+        effective_model_tag = found_weights.name.replace(".weights.h5", "").replace(".keras", "").replace(".h5", "")
+    else:
+        effective_model_tag = f"dgnet_{version_tag}_{backbone}"
 
     if found_weights:
         _ = model(tf.zeros((1, img_size[0], img_size[1], 3)), training=False)
@@ -1160,12 +1230,64 @@ def evaluate_dgnet(data_dir: str = "data/raw/dataset-splitM", checkpoint_dir: st
     else:
         print(f"[Evaluation] Warning: No trained weights checkpoint found. Evaluating with initialized model.")
 
+    print(f"[Evaluation] Model Identifier for Output: {effective_model_tag}")
+    if save_predictions:
+        print(f"[Evaluation] Saving clean GT, prediction masks, and B&W comparisons to: {pred_path.resolve()}")
+
     metrics_acc = CODMetricsAccumulator(threshold=0.5, beta_sq=0.3)
     start_time = time.perf_counter()
+
+    sample_idx = 0
+    saved_count = 0
 
     for x_batch, y_mask, _ in test_ds:
         pred_mask = model(x_batch, training=False)
         metrics_acc.update(y_mask, pred_mask)
+
+        if save_predictions:
+            batch_sz = int(tf.shape(x_batch)[0])
+            y_np = y_mask.numpy()
+            pred_np = pred_mask.numpy()
+
+            for b in range(batch_sz):
+                if sample_idx + b < len(test_imgs):
+                    stem = Path(test_imgs[sample_idx + b]).stem
+
+                    # Pure binary GT mask (0 or 255)
+                    gt_bin = (y_np[b, :, :, 0] >= 0.5).astype(np.uint8) * 255
+                    # Pure binary Prediction mask (0 or 255)
+                    pred_bin = (pred_np[b, :, :, 0] >= 0.5).astype(np.uint8) * 255
+
+                    # 1. Clean Ground Truth mask (saved once)
+                    gt_out = pred_path / f"{stem}_gt.png"
+                    if not gt_out.exists():
+                        cv2.imwrite(str(gt_out), gt_bin)
+
+                    # 2. Clean Prediction mask named with model
+                    pred_out = pred_path / f"{stem}_{effective_model_tag}_pred.png"
+                    cv2.imwrite(str(pred_out), pred_bin)
+
+                    # 3. Clean Black-and-White comparison [GROUND TRUTH | MODEL: {effective_model_tag}]
+                    h, w = gt_bin.shape[:2]
+                    separator = np.full((h, 4), 128, dtype=np.uint8)
+                    body = np.hstack([gt_bin, separator, pred_bin])
+
+                    header_h = 36
+                    header = np.zeros((header_h, body.shape[1]), dtype=np.uint8)
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    cv2.putText(header, "GROUND TRUTH", (15, 24), font, 0.5, 255, 1, cv2.LINE_AA)
+                    label_text = f"MODEL: {effective_model_tag}"
+                    right_x = w + 4 + 15
+                    cv2.putText(header, label_text, (right_x, 24), font, 0.5, 255, 1, cv2.LINE_AA)
+
+                    h_div = np.full((2, body.shape[1]), 128, dtype=np.uint8)
+                    comp_img = np.vstack([header, h_div, body])
+
+                    comp_out = pred_path / f"{stem}_{effective_model_tag}_comparison.png"
+                    cv2.imwrite(str(comp_out), comp_img)
+                    saved_count += 1
+
+            sample_idx += batch_sz
 
     total_time = time.perf_counter() - start_time
     eval_metrics = metrics_acc.result()
@@ -1259,17 +1381,25 @@ def export_tflite(
     with open(output_file, "wb") as f:
         f.write(tflite_model)
 
-    # Ensure copies are stored in both quantized and raw_checkpoints folders for automatic HF S3 sync
-    for candidate_dir in [PROJECT_ROOT / "models/raw_checkpoints", PROJECT_ROOT / "models/quantized", Path("/data/models/quantized"), Path("/data/models/raw_checkpoints")]:
+    # Ensure TFLite models are saved strictly in models/quantized/
+    for candidate_dir in [PROJECT_ROOT / "models/quantized", Path("/data/models/quantized")]:
         try:
-            if candidate_dir.exists() or candidate_dir.parent.exists():
-                candidate_dir.mkdir(parents=True, exist_ok=True)
-                target_tflite = candidate_dir / output_file.name
-                if target_tflite.resolve() != output_file.resolve():
-                    with open(target_tflite, "wb") as f:
-                        f.write(tflite_model)
+            candidate_dir.mkdir(parents=True, exist_ok=True)
+            target_tflite = candidate_dir / output_file.name
+            if target_tflite.resolve() != output_file.resolve():
+                with open(target_tflite, "wb") as f:
+                    f.write(tflite_model)
         except Exception:
             pass
+
+    # Clean up any stray .tflite files from raw_checkpoints or root models directory
+    for stray_dir in [PROJECT_ROOT / "models/raw_checkpoints", PROJECT_ROOT / "models", Path("/data/models/raw_checkpoints")]:
+        stray_file = stray_dir / output_file.name
+        if stray_file.exists() and stray_file.resolve() != output_file.resolve():
+            try:
+                stray_file.unlink()
+            except Exception:
+                pass
 
     print(f"[Export] SUCCESS: TFLite model successfully saved ({output_file.stat().st_size / (1024*1024):.2f} MB).\n")
 
@@ -1282,6 +1412,7 @@ def main():
 
     # Priority: Env Vars > Config Params > Default relative paths
     env_data_dir = os.getenv("DATA_DIR", data_cfg.get("raw_data_dir", "data/raw/dataset-splitM"))
+    env_augmented_dir = os.getenv("AUGMENTED_DIR", "data/augmented/military_tactical")
     env_model_dir = os.getenv("MODEL_DIR", train_cfg.get("model_dir", "models"))
     env_ckpt_dir = os.getenv("CHECKPOINT_DIR", train_cfg.get("checkpoint_dir", "models/raw_checkpoints"))
     env_log_dir = os.getenv("LOG_DIR", train_cfg.get("log_dir", "metrics"))
@@ -1307,10 +1438,14 @@ def main():
     parser.add_argument("--epochs", type=int, default=default_epochs, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=default_batch_size, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=default_lr, help="Learning rate")
-    parser.add_argument("--data-dir", type=str, default=env_data_dir, help="Path to data directory (or via DATA_DIR env var)")
+    parser.add_argument("--data-dir", type=str, default=env_data_dir, help="Path to raw data directory (or via DATA_DIR env var)")
+    parser.add_argument("--augmented-dir", type=str, default=env_augmented_dir, help="Path to augmented dataset directory (or via AUGMENTED_DIR env var)")
     parser.add_argument("--checkpoint-dir", type=str, default=env_ckpt_dir, help="Path to checkpoint directory (or via CHECKPOINT_DIR env var)")
     parser.add_argument("--log-dir", type=str, default=env_log_dir, help="Path to metrics/log directory (or via LOG_DIR env var)")
-    parser.add_argument("--model-dir", type=str, default=env_model_dir, help="Path to model directory (or via MODEL_DIR env var)")
+    parser.add_argument("--weights", type=str, default=None, help="Path to specific model weights checkpoint file for evaluation")
+    parser.add_argument("--pred-dir", type=str, default="experiments/predictions", help="Directory to save test prediction and comparison masks")
+    parser.add_argument("--model-tag", "--model-name", type=str, default=None, help="Custom model tag/name for evaluation output filenames")
+    parser.add_argument("--no-save-preds", action="store_true", help="Disable saving prediction mask images during evaluation")
     parser.add_argument("--summary", action="store_true", help="Print model summary and parameter stats")
     parser.add_argument("--export-tflite", action="store_true", help="Export model to TensorFlow Lite format")
     parser.add_argument("--output", type=str, default=None, help="Custom output filepath for export/checkpoint")
@@ -1328,6 +1463,7 @@ def main():
             batch_size=args.batch_size,
             learning_rate=args.lr,
             data_dir=args.data_dir,
+            augmented_dir=args.augmented_dir,
             checkpoint_dir=args.checkpoint_dir,
             log_dir=args.log_dir,
             backbone=args.backbone,
@@ -1342,10 +1478,14 @@ def main():
         evaluate_dgnet(
             data_dir=args.data_dir,
             checkpoint_dir=args.checkpoint_dir,
+            weights_path=args.weights,
+            pred_dir=args.pred_dir,
             log_dir=args.log_dir,
             backbone=args.backbone,
             kernel=args.kernel,
-            model_version=args.version
+            model_version=args.version,
+            model_tag=args.model_tag,
+            save_predictions=not args.no_save_preds
         )
 
     if args.summary:
