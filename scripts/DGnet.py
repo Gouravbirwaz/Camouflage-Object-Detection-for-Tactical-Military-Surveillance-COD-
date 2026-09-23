@@ -702,6 +702,25 @@ def train_dgnet(
 
     if explicit_weights:
         wp = Path(explicit_weights) if Path(explicit_weights).is_absolute() else PROJECT_ROOT / explicit_weights
+        if not wp.exists() or wp.stat().st_size == 0:
+            hf_token = os.getenv("HF_TOKEN")
+            if hf_token:
+                try:
+                    from huggingface_hub import hf_hub_download
+                    rel_name = "models/raw_checkpoints/" + wp.name
+                    for r in [os.getenv("HF_UPLOAD_REPO_ID", "yakshithkd/COD_training_artifacts"), "yakshithkd/COD_training_artifacts", "gouravbirwaz/COD_dataset"]:
+                        try:
+                            dl = hf_hub_download(repo_id=r, repo_type="dataset", filename=rel_name, token=hf_token)
+                            if dl and Path(dl).exists():
+                                wp.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.copy2(dl, str(wp))
+                                print(f"[Resume Training] Auto-downloaded '{wp.name}' from Hugging Face repo '{r}'!")
+                                break
+                        except Exception:
+                            continue
+                except Exception as e:
+                    print(f"[Resume Training] Notice: Could not auto-download weights: {e}")
+
         if wp.exists() and wp.stat().st_size > 0:
             print(f"\n[Resume Training] Loading specified checkpoint weights: {wp.resolve()}")
             try:
