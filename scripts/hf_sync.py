@@ -480,9 +480,26 @@ def download_dataset(data_dir: str = None):
     except Exception as e:
         print(f"[HF Sync] Dataset snapshot download notice: {e}")
 
-    # Check if dataset archive exists or needs downloading
-    has_images = any(data_path.rglob("*.jpg")) or any(data_path.rglob("*.png"))
+    # Check if real images exist (> 1KB to exclude 130-byte Git LFS / DVC pointer files)
+    def _is_valid_image_file(p: Path) -> bool:
+        try:
+            return p.is_file() and p.stat().st_size > 1024 and p.suffix.lower() in {".jpg", ".png", ".jpeg", ".bmp"}
+        except Exception:
+            return False
+
+    real_images = [f for f in data_path.rglob("*") if _is_valid_image_file(f)]
+    has_images = len(real_images) >= 50
+
     if not has_images:
+        print(f"[HF Sync] Dataset missing valid image binaries (found {len(real_images)} real images). Attempting archive download...")
+        # Remove small pointer files that would fail decoding
+        for stray in list(data_path.rglob("*")):
+            try:
+                if stray.is_file() and stray.stat().st_size <= 1024:
+                    stray.unlink()
+            except Exception:
+                pass
+
         zip_candidates = [
             PROJECT_ROOT / "data" / "dataset_raw.zip",
             PROJECT_ROOT / "dataset_raw.zip",
@@ -490,7 +507,7 @@ def download_dataset(data_dir: str = None):
         ]
         found_zip = None
         for zc in zip_candidates:
-            if zc.exists() and zc.stat().st_size > 0:
+            if zc.exists() and zc.stat().st_size > 1024:
                 found_zip = zc
                 break
 
@@ -508,7 +525,7 @@ def download_dataset(data_dir: str = None):
             except Exception as dl_err:
                 print(f"[HF Sync] Direct zip download notice: {dl_err}")
 
-        if found_zip and found_zip.exists():
+        if found_zip and found_zip.exists() and found_zip.stat().st_size > 1024:
             print(f"[HF Sync] Extracting dataset archive {found_zip}...")
             import zipfile
             extract_target = data_path.parent if data_path.name == "dataset-splitM" else data_path
@@ -526,6 +543,7 @@ def main():
     env_log_dir = os.getenv("LOG_DIR", train_cfg.get("log_dir", "metrics"))
 
     parser = argparse.ArgumentParser(description="Hugging Face Storage Bucket Synchronization Helper")
+    parser.add_argument("--repo-id", type=str, default=None, help="Target Hugging Face repository ID (e.g. yakshithkd/COD_training_artifacts)")
     parser.add_argument("--pull", "--download-all", action="store_true", help="Download latest MLflow DB, training metrics logs, and model checkpoints in one command")
     parser.add_argument("--push", "--upload-all", action="store_true", help="Upload local model checkpoints and logs/MLflow DB to HF repo")
     parser.add_argument("--recent-only", action="store_true", help="Download only latest, best, and most recent checkpoints (skips older epoch checkpoints)")
@@ -541,6 +559,9 @@ def main():
     parser.add_argument("--sync-all", action="store_true", help="Upload checkpoints, logs, and dataset in one command")
 
     args = parser.parse_args()
+    if args.repo_id:
+        global REPO_ID
+        REPO_ID = args.repo_id
 
     # Unified Pull: Download both logs (MLflow DB) and checkpoints
     if args.pull:

@@ -25,7 +25,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union
 
 import cv2
 # Prevent threadpool contention and deadlock between OpenCV and TensorFlow tf.data workers
@@ -129,7 +129,7 @@ def _find_dataset_splits_in_dir(target_dir: Path, valid_exts: set) -> Dict[str, 
                 try:
                     for f in img_dir.glob("*"):
                         try:
-                            if f.is_file() and f.suffix.lower() in valid_exts:
+                            if f.is_file() and f.suffix.lower() in valid_exts and f.stat().st_size > 1024:
                                 img_files[f.stem] = str(f.resolve())
                         except (OSError, PermissionError):
                             continue
@@ -139,7 +139,7 @@ def _find_dataset_splits_in_dir(target_dir: Path, valid_exts: set) -> Dict[str, 
                 try:
                     for f in mask_dir.glob("*"):
                         try:
-                            if f.is_file() and f.suffix.lower() in valid_exts:
+                            if f.is_file() and f.suffix.lower() in valid_exts and f.stat().st_size > 1024:
                                 mask_files[f.stem] = str(f.resolve())
                         except (OSError, PermissionError):
                             continue
@@ -163,7 +163,7 @@ def _find_dataset_splits_in_dir(target_dir: Path, valid_exts: set) -> Dict[str, 
                 try:
                     if any(ignored in f.parts for ignored in ignore_names):
                         continue
-                    if f.is_file() and f.suffix.lower() in valid_exts:
+                    if f.is_file() and f.suffix.lower() in valid_exts and f.stat().st_size > 1024:
                         p_str = str(f.parent.name.lower())
                         if any(k in p_str for k in ["image", "images", "img", "imgs", "rgb"]):
                             img_files[f.stem] = str(f.resolve())
@@ -301,27 +301,43 @@ def compute_object_gradient_np(image_uint8: np.ndarray, mask_uint8: np.ndarray) 
 
 
 def parse_sample(img_path: tf.Tensor, mask_path: tf.Tensor, image_size: Tuple[int, int]) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
-    """Reads, decodes, resizes float image [0, 1], and extracts official Canny object gradient."""
-    img_bytes = tf.io.read_file(img_path)
-    image_raw = tf.image.decode_image(img_bytes, channels=3, expand_animations=False)
-    image = tf.image.resize(image_raw, image_size)
-    image_uint8 = tf.cast(image, tf.uint8)
+    """Reads, decodes, resizes float image [0, 1], and extracts official Canny object gradient safely."""
+    def _py_load(ip_bytes, mp_bytes, h, w):
+        try:
+            ip_str = ip_bytes.decode("utf-8") if isinstance(ip_bytes, bytes) else str(ip_bytes)
+            mp_str = mp_bytes.decode("utf-8") if isinstance(mp_bytes, bytes) else str(mp_bytes)
 
-    mask_bytes = tf.io.read_file(mask_path)
-    mask = tf.image.decode_image(mask_bytes, channels=1, expand_animations=False)
-    mask = tf.image.resize(mask, image_size, method="nearest")
-    mask_bin = tf.cast(mask >= 128, tf.float32)
+            im_bgr = cv2.imread(ip_str)
+            if im_bgr is not None:
+                im_rgb = cv2.cvtColor(im_bgr, cv2.COLOR_BGR2RGB)
+                im_res = cv2.resize(im_rgb, (w, h))
+            else:
+                im_res = np.zeros((h, w, 3), dtype=np.uint8)
 
-    def _py_grad(im, m):
-        return compute_object_gradient_np(im, m)
+            m_raw = cv2.imread(mp_str, cv2.IMREAD_GRAYSCALE)
+            if m_raw is not None:
+                m_res = cv2.resize(m_raw, (w, h), interpolation=cv2.INTER_NEAREST)
+                m_bin = (m_res >= 128).astype(np.float32)[:, :, np.newaxis]
+            else:
+                m_res = np.zeros((h, w), dtype=np.uint8)
+                m_bin = np.zeros((h, w, 1), dtype=np.float32)
 
-    grad_gt = tf.numpy_function(_py_grad, [image_uint8, tf.cast(mask, tf.uint8)], tf.float32)
-    grad_gt.set_shape([image_size[0], image_size[1], 1])
+            canny = cv2.Canny(im_res, 64, 128)
+            fore = ((canny > 0) & (m_res >= 128)).astype(np.float32)[:, :, np.newaxis]
+            im_f = im_res.astype(np.float32) / 255.0
 
-    # Return float image in range [0, 1] for augmentation; normalization performed after augmentation
-    image_float = tf.cast(image, tf.float32) / 255.0
+            return im_f, m_bin, fore
+        except Exception:
+            return np.zeros((h, w, 3), dtype=np.float32), np.zeros((h, w, 1), dtype=np.float32), np.zeros((h, w, 1), dtype=np.float32)
+
+    image_float, mask_bin, grad_gt = tf.numpy_function(
+        _py_load,
+        [img_path, mask_path, image_size[0], image_size[1]],
+        [tf.float32, tf.float32, tf.float32]
+    )
     image_float.set_shape([image_size[0], image_size[1], 3])
     mask_bin.set_shape([image_size[0], image_size[1], 1])
+    grad_gt.set_shape([image_size[0], image_size[1], 1])
 
     return image_float, mask_bin, grad_gt
 
@@ -536,7 +552,8 @@ def train_dgnet(
     backbone: str = "mobilenet_v3_large",
     kernel: str = "sobel",
     lambda_grad: float = 1.0,
-    resume: bool = False,
+    resume: Union[bool, str] = False,
+    weights: str = None,
     model_version: str = None,
     experiment_name: str = None,
     enable_mlflow: bool = True
@@ -680,7 +697,22 @@ def train_dgnet(
     _ = model(dummy_x, training=False)
 
     # Checkpoint Resume Logic - Multi-candidate search (versioned priority)
-    if resume:
+    # Checkpoint Resume Logic - Supports explicit weights path or auto-discovery
+    explicit_weights = weights if weights else (resume if isinstance(resume, str) and resume.lower() not in ("true", "1") else None)
+
+    if explicit_weights:
+        wp = Path(explicit_weights) if Path(explicit_weights).is_absolute() else PROJECT_ROOT / explicit_weights
+        if wp.exists() and wp.stat().st_size > 0:
+            print(f"\n[Resume Training] Loading specified checkpoint weights: {wp.resolve()}")
+            try:
+                model.load_weights(str(wp))
+                print(f"[Resume Training] Successfully loaded checkpoint weights from {wp.name}!")
+            except Exception as load_err:
+                print(f"[Resume Training] Warning: Failed to load weights from {wp.name}: {load_err}")
+                print(f"[Resume Training] Proceeding with fresh initialized weights.")
+        else:
+            print(f"\n[Resume Training] Notice: Specified weights file not found: {wp.resolve()}. Proceeding with fresh training.")
+    elif resume:
         candidate_dirs = [
             ckpt_dir,
             Path("/data/models/raw_checkpoints"),
@@ -698,6 +730,8 @@ def train_dgnet(
                     f"dgnet_{version_tag}_latest.weights.h5",
                     f"dgnet_{version_tag}_best.weights.h5",
                     f"dgnet_{version_tag}_final.weights.h5",
+                    "dgnet_benchmark_best.weights.h5",
+                    "dgnet_best.weights.h5",
                 ]
                 for w_name in w_candidates:
                     wp = cdir / w_name
@@ -710,7 +744,7 @@ def train_dgnet(
                 continue
 
         if found_weights:
-            print(f"\n[Resume Training] Found compatible checkpoint weights for {version_tag}: {found_weights.resolve()}")
+            print(f"\n[Resume Training] Found compatible checkpoint weights: {found_weights.resolve()}")
             try:
                 model.load_weights(str(found_weights))
                 print(f"[Resume Training] Successfully loaded checkpoint weights from {found_weights.name}!")
@@ -1431,7 +1465,7 @@ def main():
     parser = argparse.ArgumentParser(description="DGNet: Deep Gradient Network Real Model Training & Execution (TensorFlow 2.x)")
     parser.add_argument("--train", action="store_true", help="Execute real model training on dataset")
     parser.add_argument("--evaluate", action="store_true", help="Evaluate trained model on test dataset split")
-    parser.add_argument("--resume", action="store_true", default=env_resume, help="Resume training from latest checkpoint in CHECKPOINT_DIR")
+    parser.add_argument("--resume", nargs="?", const=True, default=env_resume, help="Resume training from latest checkpoint, or specify path to weights file")
     parser.add_argument("--version", "--model-version", type=str, default=default_version, help="Model version tag for checkpointing (e.g. v1.0)")
     parser.add_argument("--backbone", type=str, default=default_backbone, help="Backbone architecture")
     parser.add_argument("--kernel", type=str, default=default_kernel, help="Gradient kernel type")
@@ -1442,7 +1476,7 @@ def main():
     parser.add_argument("--augmented-dir", type=str, default=env_augmented_dir, help="Path to augmented dataset directory (or via AUGMENTED_DIR env var)")
     parser.add_argument("--checkpoint-dir", type=str, default=env_ckpt_dir, help="Path to checkpoint directory (or via CHECKPOINT_DIR env var)")
     parser.add_argument("--log-dir", type=str, default=env_log_dir, help="Path to metrics/log directory (or via LOG_DIR env var)")
-    parser.add_argument("--weights", type=str, default=None, help="Path to specific model weights checkpoint file for evaluation")
+    parser.add_argument("--weights", type=str, default=None, help="Path to specific model weights checkpoint file for training or evaluation")
     parser.add_argument("--pred-dir", type=str, default="experiments/predictions", help="Directory to save test prediction and comparison masks")
     parser.add_argument("--model-tag", "--model-name", type=str, default=None, help="Custom model tag/name for evaluation output filenames")
     parser.add_argument("--no-save-preds", action="store_true", help="Disable saving prediction mask images during evaluation")
@@ -1469,6 +1503,7 @@ def main():
             backbone=args.backbone,
             kernel=args.kernel,
             resume=args.resume,
+            weights=args.weights,
             model_version=args.version,
             experiment_name=args.experiment_name,
             enable_mlflow=not args.no_mlflow
