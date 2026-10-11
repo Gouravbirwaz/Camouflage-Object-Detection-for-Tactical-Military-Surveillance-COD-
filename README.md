@@ -43,16 +43,18 @@ COD_PROJECT/
 │   └── tensorrt/                  # Optimized TensorRT .engine files for NVIDIA Jetson
 ├── notebooks/                     # Exploratory analysis & prototyping notebooks
 ├── requirements/                  # Requirement specifications
-├── scripts/                       # Execution scripts (DGnet.py, hf_sync.py, launch_hf_job.py)
-├── src/                           # Core Python source package (`cod_framework`)
+├── scripts/                       # Lightweight CLI wrappers (backward-compatible entrypoints)
+├── src/                           # Modular Python architecture
 │   ├── api/                       # FastAPI Command & Control (C2) service
-│   ├── data/                      # Data loaders & DVC pipelines
-│   ├── inference/                 # High-performance TensorRT edge inference engine
-│   ├── integration/               # MAVLink UAV flight controller communication handler
-│   ├── models/                    # DGNet architecture (Context Branch, Texture Branch, PDC Decoder)
-│   ├── optimization/              # Pruning, INT8 Quantization, Distillation modules
-│   ├── utils/                     # Loss functions (BCE + Gradient Loss) & metrics
-│   └── visualization/             # Video stream rendering, mask overlays & bounding boxes
+│   ├── data/                      # Streaming tf.data pipeline, GT mask converter, augmentation
+│   ├── inference/                 # Multi-model inference engine (Keras/TFLite/ONNX) & test evaluator
+│   ├── integration/               # Hugging Face Hub sync, remote GPU job launchers, deployment, monitor
+│   ├── models/                    # DGNet architecture (Context, Texture, GIT, NCD, Multi-Task loss)
+│   ├── optimization/              # High-fidelity TFLite converter (FP32 lossless, FP16, INT8)
+│   ├── tracking/                  # MLflow experiment tracking & artifact logging
+│   ├── training/                  # DGNet training loop, learning rate schedules, benchmark runner
+│   ├── utils/                     # Config manager, GPU environment detection, COD metrics
+│   └── visualization/             # Mask rendering, color heatmaps, contour overlays, HTML reports
 ├── tests/                         # Comprehensive Pytest test suite
 ├── .dvcignore                     # DVC ignore rules
 ├── .gitignore                     # Production Git ignore configuration

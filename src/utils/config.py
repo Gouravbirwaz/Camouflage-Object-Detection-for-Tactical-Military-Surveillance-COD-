@@ -13,6 +13,11 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
+def get_project_root() -> Path:
+    """Returns the canonical root Path of the COD_PROJECT repository."""
+    return PROJECT_ROOT
+
+
 class ConfigDict(dict):
     """Dictionary subclass supporting attribute-style dot notation access."""
     def __getattr__(self, key: str) -> Any:

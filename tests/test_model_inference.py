@@ -318,10 +318,11 @@ def save_multi_model_comparison(original: np.ndarray, gt_mask: np.ndarray,
 def find_default_sample_images() -> list:
     """Finds candidate test images from the dataset."""
     candidates = [
-        # PROJECT_ROOT / "data/raw/dataset-splitM/Testing/Images/image515.jpg",
-        PROJECT_ROOT / "data/raw/dataset-splitM/Testing/Images/image519.jpg",
-        PROJECT_ROOT / "data/raw/dataset-splitM/Testing/Images/image501.jpg",
-        PROJECT_ROOT / "data/raw/dataset-splitM/Testing/Images/image1000.jpg",
+        # # PROJECT_ROOT / "data/raw/dataset-splitM/Testing/Images/image515.jpg",
+        # PROJECT_ROOT / "data/raw/dataset-splitM/Testing/Images/image519.jpg",
+        # PROJECT_ROOT / "data/raw/dataset-splitM/Testing/Images/image501.jpg",
+        # PROJECT_ROOT / "data/raw/dataset-splitM/Testing/Images/image1000.jpg",
+        PROJECT_ROOT / "test_data.jpeg"
     ]
     found = [str(c) for c in candidates if c.exists()]
     if found:

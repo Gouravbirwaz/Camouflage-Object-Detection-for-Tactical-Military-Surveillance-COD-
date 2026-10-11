@@ -1,0 +1,83 @@
+{
+    "dataset_samples": 330,
+    "proposed_accuracy": {
+        "mae": 0.2069,
+        "f_beta": 0.0,
+        "s_measure": 0.7931,
+        "e_measure": 0.8137
+    },
+    "dgnet_accuracy": {
+        "mae": 0.8138,
+        "f_beta": 0.0,
+        "s_measure": 0.1862,
+        "e_measure": 0.3414
+    },
+    "complexity": {
+        "proposed": {
+            "params": 3578442,
+            "gflops": 4.34,
+            "size_mb": 14.99
+        },
+        "dgnet": {
+            "params": 18417067,
+            "gflops": 7.5,
+            "size_mb": 70.14
+        },
+        "reductions": {
+            "parameter_reduction_percent": 80.57,
+            "flop_reduction_percent": 42.13,
+            "size_reduction_percent": 78.63
+        }
+    },
+    "proposed_latency": {
+        "mean_latency_ms": 592.56,
+        "median_latency_ms": 555.75,
+        "std_latency_ms": 113.14,
+        "p95_latency_ms": 843.8,
+        "fps": 1.7
+    },
+    "dgnet_latency": {
+        "mean_latency_ms": 189.91,
+        "median_latency_ms": 189.95,
+        "std_latency_ms": 14.09,
+        "p95_latency_ms": 212.39,
+        "fps": 5.3
+    },
+    "tflite_benchmarks": [
+        {
+            "format": "FP32",
+            "size_mb": 13.59,
+            "latency_ms": 61.34,
+            "fps": 16.3,
+            "mae": 0.1953,
+            "f_beta": 0.0
+        },
+        {
+            "format": "FP16",
+            "size_mb": 6.86,
+            "latency_ms": 66.02,
+            "fps": 15.1,
+            "mae": 0.1952,
+            "f_beta": 0.0
+        },
+        {
+            "format": "INT8",
+            "size_mb": 3.74,
+            "latency_ms": 111.73,
+            "fps": 9.0,
+            "mae": 0.2008,
+            "f_beta": 0.0
+        }
+    ],
+    "dgnet_edge_deployment": {
+        "onnx": {
+            "status": "Failed",
+            "error": "No module named 'onnxscript'",
+            "notes": "ONNX conversion limitation."
+        },
+        "tflite": {
+            "status": "Limited / Unsupported direct path",
+            "notes": "PyTorch DGNet requires PyTorch -> ONNX -> ONNX-TF -> TFLite. Grouped Conv2D with variable channel slicing (GIT module) and dynamic feature interleaving introduces graph flattening errors in standard TFLite micro runtime."
+        }
+    }
+}
