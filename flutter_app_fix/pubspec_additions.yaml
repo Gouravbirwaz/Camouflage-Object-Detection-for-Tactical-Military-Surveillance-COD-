@@ -1,0 +1,29 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# FLUTTER_APP_FIX — pubspec.yaml additions
+#
+# Merge these sections into your existing pubspec.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # TFLite runtime — runs the DGNet .tflite model
+  tflite_flutter: ^0.10.4
+
+  # Image decoding/resizing — used for preprocessing camera frames
+  image: ^4.5.2
+
+  # Camera plugin — for live feed
+  camera: ^0.10.5+9
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Add your .tflite model to assets
+# ─────────────────────────────────────────────────────────────────────────────
+flutter:
+  assets:
+    - assets/models/dgnet_fp32.tflite
+    # If you also have fp16 or int8 versions:
+    # - assets/models/dgnet_fp16.tflite
+    # - assets/models/dgnet_int8.tflite

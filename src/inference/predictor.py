@@ -14,6 +14,12 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import tensorflow as tf
 
+try:
+    import cv2
+    _HAS_CV2 = True
+except ImportError:
+    _HAS_CV2 = False
+
 from src.utils.config import get_project_root, load_project_config
 from src.utils.metrics import compute_all_metrics
 from src.models.dgnet import build_dgnet_model
@@ -27,13 +33,19 @@ from src.visualization.visualizer import (
 PROJECT_ROOT = get_project_root()
 
 
+# ImageNet statistics used during DGNet training — MUST match exactly on edge.
+_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
 def load_and_preprocess_image(image_path: Union[str, Path], image_size: Tuple[int, int] = (384, 384)) -> Tuple[tf.Tensor, np.ndarray]:
     """
     Loads an RGB image, resizes it, and normalizes using ImageNet mean/std.
+    This MUST match the normalization applied in src/data/dataset.py during training.
 
     Returns:
         (input_tensor, original_image)
-        - input_tensor: [1, H, W, 3] float32 tensor
+        - input_tensor: [1, H, W, 3] float32 tensor, ImageNet-normalized
         - original_image: original-resolution uint8 numpy array for visualization
     """
     raw_bytes = tf.io.read_file(str(image_path))
@@ -41,12 +53,46 @@ def load_and_preprocess_image(image_path: Union[str, Path], image_size: Tuple[in
     original_np = original.numpy()
 
     resized = tf.image.resize(original, image_size)
-    imagenet_mean = tf.constant([0.485, 0.456, 0.406], dtype=tf.float32)
-    imagenet_std = tf.constant([0.229, 0.224, 0.225], dtype=tf.float32)
+    imagenet_mean = tf.constant(_IMAGENET_MEAN, dtype=tf.float32)
+    imagenet_std  = tf.constant(_IMAGENET_STD,  dtype=tf.float32)
     normalized = (tf.cast(resized, tf.float32) / 255.0 - imagenet_mean) / imagenet_std
     input_tensor = tf.expand_dims(normalized, axis=0)
 
     return input_tensor, original_np
+
+
+def edge_preprocess_frame(
+    frame: np.ndarray,
+    image_size: Tuple[int, int] = (384, 384)
+) -> np.ndarray:
+    """
+    EDGE DEVICE HELPER — preprocess a raw camera frame for DGNet inference.
+
+    Call this function on every frame captured from cv2.VideoCapture or a camera
+    on the edge device (Jetson, Raspberry Pi, etc.) before feeding to the model.
+
+    Args:
+        frame: uint8 BGR numpy array from cv2.VideoCapture (H, W, 3).
+        image_size: (height, width) the model was trained at, default (384, 384).
+
+    Returns:
+        float32 numpy array of shape (1, H, W, 3), ImageNet-normalized, ready for
+        interpreter.set_tensor() or model().
+    """
+    if not _HAS_CV2:
+        raise ImportError("opencv-python is required on the edge device. Run: pip install opencv-python-headless")
+
+    # 1. BGR -> RGB  (OpenCV reads BGR; the model was trained on RGB)
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    # 2. Resize to model input resolution
+    resized = cv2.resize(rgb, (image_size[1], image_size[0])).astype(np.float32)
+
+    # 3. Normalize to [0, 1] then apply ImageNet mean / std  (matches dataset.py training pipeline)
+    normalized = (resized / 255.0 - _IMAGENET_MEAN) / _IMAGENET_STD
+
+    # 4. Add batch dimension
+    return np.expand_dims(normalized, axis=0).astype(np.float32)
 
 
 def load_ground_truth(gt_path: Union[str, Path], image_size: Tuple[int, int] = (384, 384)) -> Optional[tf.Tensor]:
@@ -64,45 +110,92 @@ def load_ground_truth(gt_path: Union[str, Path], image_size: Tuple[int, int] = (
 def process_prediction_mask(
     pred_prob: np.ndarray,
     threshold: float = 0.5,
-    sharpen: bool = True,
-    adaptive_threshold: bool = True,
+    min_contour_area: int = 300,
+    # Legacy parameters kept for API compatibility — no longer active in production.
+    sharpen: bool = False,
+    adaptive_threshold: bool = False,
     auto_invert: bool = False
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Processes raw prediction probability array into a scaled probability map and binary mask.
+    Converts a raw DGNet sigmoid probability map into a cleaned binary detection mask.
+
+    Key design decisions to prevent false-positive detections on the edge device:
+
+    1. NO min-max stretching — raw sigmoid probabilities are used directly.
+       The old approach scaled [p_min, p_max] to [0, 1], which meant that a frame
+       with zero camouflaged objects (max prob ≈ 0.02) would have 0.02 stretched to
+       1.0, guaranteed to exceed the threshold and produce a false detection.
+
+    2. Early-exit for no-object frames — if the peak probability across the entire
+       frame is below 'threshold', the frame contains no camouflaged object and a
+       zero mask is returned immediately without further processing.
+
+    3. Contour-area filtering — small blobs from texture noise or sharp edges on
+       ordinary objects are removed. Only contiguous detections larger than
+       'min_contour_area' pixels are kept.
+
+    Args:
+        pred_prob:          Raw sigmoid output from the model, shape (H, W) or (H, W, 1),
+                            values in [0.0, 1.0].
+        threshold:          Minimum sigmoid probability to classify a pixel as camouflaged.
+                            Recommended: 0.50–0.65 for deployment.
+        min_contour_area:   Minimum connected-component area in pixels to keep.
+                            Blobs smaller than this are treated as noise and discarded.
+                            Default 300 px works well at 384×384 resolution.
+        sharpen:            Deprecated — has no effect. Kept for API compatibility.
+        adaptive_threshold: Deprecated — has no effect. Kept for API compatibility.
+        auto_invert:        Deprecated — has no effect. Kept for API compatibility.
 
     Returns:
-        (scaled_prob, binary_mask)
+        (prob_map, binary_mask): both are float32 arrays of the same spatial shape
+        as pred_prob (H, W) or (H, W, 1).
     """
     is_3d = (pred_prob.ndim == 3)
-    pred_prob_2d = pred_prob[:, :, 0] if is_3d else pred_prob
+    prob_2d = pred_prob[:, :, 0] if is_3d else pred_prob.copy()
 
-    p_min, p_max = float(pred_prob_2d.min()), float(pred_prob_2d.max())
+    # --- Gate 1: No object in frame -------------------------------------------
+    # If the model's maximum confidence anywhere in the frame is below the
+    # threshold, there is simply no camouflaged object to report. Return a clean
+    # zero mask immediately. This is the most important false-positive guard.
+    if float(prob_2d.max()) < threshold:
+        zero = np.zeros_like(prob_2d)
+        if is_3d:
+            return zero[:, :, np.newaxis], zero[:, :, np.newaxis]
+        return zero, zero
 
-    if sharpen and (p_max - p_min) > 1e-4:
-        scaled_prob_2d = (pred_prob_2d - p_min) / (p_max - p_min)
-    else:
-        scaled_prob_2d = pred_prob_2d.copy()
+    # --- Gate 2: Absolute threshold on raw probabilities -----------------------
+    # Use the sigmoid probabilities exactly as the model produced them. Do NOT
+    # rescale/stretch. A pixel must genuinely exceed 'threshold' to be flagged.
+    binary_2d = (prob_2d >= threshold).astype(np.uint8)
 
-    initial_cov = np.mean(scaled_prob_2d >= threshold)
-    if auto_invert and initial_cov > 0.5:
-        scaled_prob_2d = 1.0 - scaled_prob_2d
+    # --- Gate 3: Contour-area noise filter ------------------------------------
+    # Small blobs caused by edge textures on normal objects are removed.
+    if _HAS_CV2 and binary_2d.any():
+        contours, _ = cv2.findContours(binary_2d, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cleaned = np.zeros_like(binary_2d)
+        for cnt in contours:
+            if cv2.contourArea(cnt) >= min_contour_area:
+                cv2.drawContours(cleaned, [cnt], -1, 1, thickness=-1)
+        binary_2d = cleaned
+    # Fallback (no cv2): use a simple erosion-like minimum area check via scipy
+    elif not _HAS_CV2 and binary_2d.any():
+        try:
+            from scipy import ndimage as ndi
+            labeled, n_features = ndi.label(binary_2d)
+            cleaned = np.zeros_like(binary_2d)
+            for lbl in range(1, n_features + 1):
+                component = (labeled == lbl)
+                if component.sum() >= min_contour_area:
+                    cleaned[component] = 1
+            binary_2d = cleaned
+        except ImportError:
+            pass  # Keep binary_2d as-is if neither cv2 nor scipy is available
 
-    if adaptive_threshold and p_max < threshold and (p_max - p_min) > 1e-4:
-        effective_thresh = 0.5
-    else:
-        effective_thresh = threshold
-
-    binary_mask_2d = (scaled_prob_2d >= effective_thresh).astype(np.float32)
+    binary_float = binary_2d.astype(np.float32)
 
     if is_3d:
-        scaled_prob = scaled_prob_2d[:, :, np.newaxis]
-        binary_mask = binary_mask_2d[:, :, np.newaxis]
-    else:
-        scaled_prob = scaled_prob_2d
-        binary_mask = binary_mask_2d
-
-    return scaled_prob, binary_mask
+        return prob_2d[:, :, np.newaxis], binary_float[:, :, np.newaxis]
+    return prob_2d, binary_float
 
 
 def find_default_sample_images() -> List[str]:
@@ -278,10 +371,12 @@ def run_inference_pipeline(
     all_models: bool = False,
     backbone: Optional[str] = None,
     threshold: float = 0.5,
+    min_contour_area: int = 300,
     invert: bool = False,
+    # Legacy options — kept for CLI compatibility, no longer used internally.
     auto_invert: bool = False,
-    sharpen: bool = True,
-    adaptive_threshold: bool = True,
+    sharpen: bool = False,
+    adaptive_threshold: bool = False,
     output_dir: Optional[str] = None,
 ):
     """Executes multi-model inference pipeline and generates reports and visual masks."""
@@ -326,7 +421,7 @@ def run_inference_pipeline(
     for m in models_to_test:
         print(f"    • [{m['model_type'].upper()}] {m['name']} ({m['parent_folder']})")
     print(f"  Image Size:       {img_size}")
-    print(f"  Threshold:        {threshold} (Adaptive Sharpening: {sharpen})")
+    print(f"  Threshold:        {threshold}  |  Min Contour Area: {min_contour_area} px")
     print(f"  Output Dir:       {out_dir.resolve()}")
     print("-" * 70 + "\n")
 
@@ -356,9 +451,7 @@ def run_inference_pipeline(
                 scaled_prob, binary_mask = process_prediction_mask(
                     pred_prob_np,
                     threshold=threshold,
-                    sharpen=sharpen,
-                    adaptive_threshold=adaptive_threshold,
-                    auto_invert=auto_invert or invert
+                    min_contour_area=min_contour_area,
                 )
 
                 tag = m_info["tag"]

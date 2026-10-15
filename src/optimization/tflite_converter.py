@@ -76,11 +76,22 @@ def ensure_weights_available(weights_path: Path, repo_id: Optional[str] = None) 
     )
 
 
+# ImageNet statistics — must match training pipeline in src/data/dataset.py
+_CALIB_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_CALIB_IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
 def collect_calibration_images(
     num_samples: int = 100,
     image_size: Tuple[int, int] = (384, 384)
 ) -> List[np.ndarray]:
-    """Collects real camouflage training/testing images for accurate INT8 calibration."""
+    """Collects real camouflage training/testing images for accurate INT8 calibration.
+
+    Applies the same ImageNet normalization that was used during training so that
+    the quantizer sees the exact same input distribution as the trained model.
+    Using un-normalized [0, 1] inputs for calibration causes wrong INT8 scales
+    which leads to false-positive detections on the edge device.
+    """
     search_dirs = [
         PROJECT_ROOT / "data" / "raw" / "dataset-splitM" / "Training" / "images",
         PROJECT_ROOT / "data" / "raw" / "dataset-splitM" / "Testing" / "images",
@@ -104,13 +115,20 @@ def collect_calibration_images(
             if img is not None:
                 img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 img = cv2.resize(img, (image_size[1], image_size[0]))
+                # Normalize to [0, 1] then apply ImageNet mean/std — same as dataset.py training pipeline
                 img = img.astype(np.float32) / 255.0
+                img = (img - _CALIB_IMAGENET_MEAN) / _CALIB_IMAGENET_STD
                 samples.append(np.expand_dims(img, axis=0))
     else:
-        print("[Calibration] Notice: No local dataset images found. Using synthetic edge distribution samples.")
+        print("[Calibration] Notice: No local dataset images found. Using synthetic ImageNet-normalized samples.")
+        # Simulate ImageNet-normalized inputs by sampling from the expected
+        # post-normalization distribution (roughly Gaussian, mean~0, std~1).
+        np.random.seed(42)
         for _ in range(num_samples):
-            base = np.random.uniform(0.2, 0.8, size=(1, image_size[0], image_size[1], 3)).astype(np.float32)
-            samples.append(base)
+            # Raw pixel values uniformly distributed [0.2, 0.8] after /255
+            raw = np.random.uniform(0.2, 0.8, size=(image_size[0], image_size[1], 3)).astype(np.float32)
+            normalized = (raw - _CALIB_IMAGENET_MEAN) / _CALIB_IMAGENET_STD
+            samples.append(np.expand_dims(normalized, axis=0))
 
     return samples
 
@@ -164,9 +182,14 @@ def export_tflite(
 
     if quantize_int8:
         print("[Export] Applying INT8 Quantization...")
+        _mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        _std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
         def representative_dataset_gen():
+            np.random.seed(42)
             for _ in range(50):
-                yield [np.random.normal(size=(1, image_size[0], image_size[1], 3)).astype(np.float32)]
+                # Use ImageNet-normalized random inputs to match the training distribution.
+                raw = np.random.uniform(0.2, 0.8, size=(1, image_size[0], image_size[1], 3)).astype(np.float32)
+                yield [((raw - _mean) / _std).astype(np.float32)]
         converter.representative_dataset = representative_dataset_gen
         converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
         converter.inference_input_type = tf.float32
