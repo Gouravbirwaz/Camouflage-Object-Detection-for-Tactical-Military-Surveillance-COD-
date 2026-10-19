@@ -1,0 +1,20 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: edge-ai-inference-monitor
+  namespace: edge-ai
+  labels:
+    app: edge-ai-inference
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: edge-ai-inference
+  namespaceSelector:
+    matchNames:
+      - edge-ai
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 5s
+      scrapeTimeout: 3s

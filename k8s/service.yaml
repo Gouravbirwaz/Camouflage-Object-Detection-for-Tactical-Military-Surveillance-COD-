@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: edge-ai-inference
+  namespace: edge-ai
+  labels:
+    app: edge-ai-inference
+    tier: edge-vision
+    release: prometheus
+spec:
+  type: ClusterIP
+  selector:
+    app: edge-ai-inference
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP

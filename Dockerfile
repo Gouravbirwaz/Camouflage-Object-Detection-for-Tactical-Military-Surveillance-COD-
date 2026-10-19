@@ -1,60 +1,54 @@
-# Production Dockerfile for Hugging Face GPU Space (NVIDIA T4 / A10G / A100)
-FROM tensorflow/tensorflow:2.16.1-gpu
+# syntax=docker/dockerfile:1
+# Minimal, Portable Edge AI Inference Container for DGNet Camouflaged Object Detection
+# Multi-arch support: linux/amd64 (PC simulation) and linux/arm64 (NVIDIA Jetson / ARM devices)
+FROM python:3.11-slim-bookworm
 
-# Set working directory
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
+    MODEL_PATH=/app/models/proposed_mobilenet_v3_fp16.tflite \
+    CAMERA_SOURCE=ingest \
+    INPUT_HEIGHT=384 \
+    INPUT_WIDTH=384 \
+    CONFIDENCE_THRESHOLD=0.50 \
+    MIN_CONTOUR_AREA=300 \
+    TARGET_FPS=15.0 \
+    PORT=8000 \
+    HOST=0.0.0.0
+
 WORKDIR /app
 
-# Install system dependencies
+# Install minimal OS runtime libraries required for OpenCV
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git \
-    curl \
-    libgl1 \
     libglib2.0-0 \
+    libgomp1 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install Python dependencies
-COPY requirements.txt .
+# Install lean runtime dependencies only (FastAPI, uvicorn, prometheus-client, TFLite/TF)
+COPY requirements/edge_requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir --ignore-installed blinker && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r /tmp/requirements.txt && \
+    rm -f /tmp/requirements.txt
 
-# Copy project source files and dataset
-COPY src/ ./src/
-COPY scripts/ ./scripts/
-COPY configs/ ./configs/
-COPY data/ ./data/
-COPY .dvc/ ./.dvc/
-COPY params.yaml .
-COPY dvc.yaml .
-COPY entrypoint.sh .
+# Create non-root system user for production security
+RUN groupadd -g 10001 edgegroup && \
+    useradd -u 10001 -g edgegroup -s /bin/bash -m edgeuser
 
-# Set permissions & sanitize Windows CRLF line endings
-RUN sed -i 's/\r$//' entrypoint.sh && chmod +x entrypoint.sh
+# Copy ONLY the minimal inference runtime and the single TFLite model file
+# (NO training scripts, NO datasets, NO MLflow, NO DVC, NO configs)
+COPY src/api/ /app/src/api/
+COPY models/quantized/proposed_mobilenet_v3_fp16.tflite /app/models/proposed_mobilenet_v3_fp16.tflite
 
-# Environment defaults
-ENV PYTHONUNBUFFERED=1
-ENV DATA_DIR=data/raw/dataset-splitM
-ENV MODEL_DIR=models
-ENV CHECKPOINT_DIR=models/raw_checkpoints
-ENV LOG_DIR=metrics
-ENV EPOCHS=100
-ENV BATCH_SIZE=8
-ENV RESUME=false
-ENV MODEL_VERSION=v2.0_official_dgnet
-ENV TRAINING_PLATFORM=huggingface
+RUN chown -R edgeuser:edgegroup /app
 
-# MLflow Experiment Tracking & S3 Artifact Defaults
-ENV MLFLOW_TRACKING_URI=http://127.0.0.1:5000
-ENV MLFLOW_EXPERIMENT_NAME=COD-Camouflage-Detection
-ENV MLFLOW_S3_ENDPOINT_URL=https://s3.hf.co/gouravbirwaz
-ENV AWS_ENDPOINT_URL_S3=https://s3.hf.co/gouravbirwaz
-ENV MLFLOW_ARTIFACT_LOCATION=s3://COD_dataset/dvc-store/mlflow-artifacts
-ENV HF_S3_URI=s3://COD_dataset/dvc-store
+USER edgeuser
 
-ENV AWS_DEFAULT_REGION=us-east-1
+EXPOSE 8000
 
-# Expose port for HF Space health checks
-EXPOSE 7860
+# Container liveness check
+HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
 
-# Run entrypoint script
-ENTRYPOINT ["/app/entrypoint.sh"]
+# Single primary application entrypoint
+CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge-ai-inference
+  namespace: edge-ai
+  labels:
+    app: edge-ai-inference
+    tier: edge-vision
+    release: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: edge-ai-inference
+  template:
+    metadata:
+      labels:
+        app: edge-ai-inference
+        tier: edge-vision
+        release: prometheus
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: inference
+          image: edge-ai-inference:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: MODEL_PATH
+              value: "/app/models/proposed_mobilenet_v3_fp16.tflite"
+            - name: CAMERA_SOURCE
+              value: "ingest"
+            - name: INPUT_HEIGHT
+              value: "384"
+            - name: INPUT_WIDTH
+              value: "384"
+            - name: CONFIDENCE_THRESHOLD
+              value: "0.50"
+            - name: MIN_CONTOUR_AREA
+              value: "300"
+            - name: TARGET_FPS
+              value: "15.0"
+            - name: PORT
+              value: "8000"
+            - name: HOST
+              value: "0.0.0.0"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2560Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
