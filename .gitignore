@@ -76,7 +76,7 @@ models/raw_checkpoints/*.h5
 models/raw_checkpoints/*.keras
 models/pruned/*.pt
 models/quantized/*.onnx
-
+models/quantized/*.tflite
 models/onnx/*.onnx
 models/tensorrt/*.engine
 models/tensorrt/*.plan
