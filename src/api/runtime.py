@@ -189,7 +189,7 @@ class EdgeInferenceRuntime:
         return pred
 
     def _open_camera(self) -> bool:
-        """Attempts to open the configured camera source."""
+        """Attempts to open the configured camera source with multi-backend negotiation."""
         source = str(self.camera_source).strip()
 
         if source.lower() in {"ingest", "bridge", "none"}:
@@ -199,34 +199,51 @@ class EdgeInferenceRuntime:
             print("[Runtime] Configured in INGEST/BRIDGE mode. Awaiting external frame feed at /api/feed.")
             return True
 
+        # Resolve device index (/dev/video0 -> 0, or "0" -> 0)
+        idx = None
         if source.isdigit():
             idx = int(source)
-            system = platform.system().lower()
-            if "windows" in system:
-                cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        elif source.startswith("/dev/video") and source[10:].isdigit():
+            idx = int(source[10:])
+
+        system = platform.system().lower()
+        cap = None
+
+        if idx is not None:
+            if "linux" in system:
+                cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+                if not cap.isOpened():
+                    cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
                 if not cap.isOpened():
                     cap = cv2.VideoCapture(idx)
-            elif "linux" in system:
-                cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+            elif "windows" in system:
+                cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
                 if not cap.isOpened():
                     cap = cv2.VideoCapture(idx)
             else:
                 cap = cv2.VideoCapture(idx)
         else:
+            # RTSP, HTTP, or video file stream
             cap = cv2.VideoCapture(source)
 
         if cap is not None and cap.isOpened():
+            # Configure frame negotiation for low-latency edge streaming
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             self.cap = cap
             self.is_camera_connected = True
             self.last_camera_error = ""
             CAMERA_CONNECTED.set(1)
-            print(f"[Runtime] Camera source '{source}' successfully opened.")
+            print(f"[Runtime] Camera hardware '{source}' successfully opened.")
             return True
 
         self.is_camera_connected = False
-        self.last_camera_error = f"Cannot open camera source '{source}'. If running inside Docker/Kind, use host camera bridge at /api/feed."
+        self.last_camera_error = f"Hardware camera '{source}' not accessible inside this container. Ingest endpoint (/api/feed) is active and awaiting frames."
+        self._is_ingest_mode = True  # Seamless fallback to ingest mode
         CAMERA_CONNECTED.set(0)
+        print(f"[Runtime Notice] {self.last_camera_error}")
         return False
 
     def _close_camera(self):

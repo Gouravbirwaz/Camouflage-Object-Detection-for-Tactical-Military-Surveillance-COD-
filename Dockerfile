@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
     MODEL_PATH=/app/models/proposed_mobilenet_v3_fp16.tflite \
-    CAMERA_SOURCE=ingest \
+    CAMERA_SOURCE=0 \
     INPUT_HEIGHT=384 \
     INPUT_WIDTH=384 \
     CONFIDENCE_THRESHOLD=0.50 \
@@ -18,10 +18,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Install minimal OS runtime libraries required for OpenCV
+# Install minimal OS runtime libraries required for OpenCV and Linux V4L2 camera capture
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     libgomp1 \
+    libv4l-0 \
+    v4l-utils \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -31,9 +33,9 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r /tmp/requirements.txt && \
     rm -f /tmp/requirements.txt
 
-# Create non-root system user for production security
+# Create non-root system user with video group permissions for /dev/video* hardware access
 RUN groupadd -g 10001 edgegroup && \
-    useradd -u 10001 -g edgegroup -s /bin/bash -m edgeuser
+    useradd -u 10001 -g edgegroup -G video -s /bin/bash -m edgeuser
 
 # Copy ONLY the minimal inference runtime and the single TFLite model file
 # (NO training scripts, NO datasets, NO MLflow, NO DVC, NO configs)
