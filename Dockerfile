@@ -37,10 +37,10 @@ RUN pip install --no-cache-dir --upgrade pip && \
 RUN groupadd -g 10001 edgegroup && \
     useradd -u 10001 -g edgegroup -G video -s /bin/bash -m edgeuser
 
-# Copy ONLY the minimal inference runtime and the single TFLite model file
-# (NO training scripts, NO datasets, NO MLflow, NO DVC, NO configs)
+# Copy ONLY the minimal inference runtime, single TFLite model, and lightweight test image
 COPY src/api/ /app/src/api/
 COPY models/quantized/proposed_mobilenet_v3_fp16.tflite /app/models/proposed_mobilenet_v3_fp16.tflite
+COPY test_data.jpeg /app/test_data.jpeg
 
 RUN chown -R edgeuser:edgegroup /app
 

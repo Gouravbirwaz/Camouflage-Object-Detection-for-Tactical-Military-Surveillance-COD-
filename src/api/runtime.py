@@ -83,6 +83,8 @@ class EdgeInferenceRuntime:
         self._latest_raw_frame: Optional[np.ndarray] = None
         self._latest_annotated_frame: Optional[np.ndarray] = None
         self._latest_jpeg: Optional[bytes] = None
+        self.simulation_active = os.getenv("AUTO_SIMULATE", "false").lower() in {"true", "1", "yes"}
+        self._sample_img: Optional[np.ndarray] = None
         self._latest_telemetry: Dict = {
             "status": "initializing",
             "detected": False,
@@ -262,6 +264,22 @@ class EdgeInferenceRuntime:
         reconnect_delay = 1.0
 
         while not self._stop_event.is_set():
+            # Internal simulation loop for zero-dependency container test streaming
+            if self.simulation_active:
+                if self._sample_img is None:
+                    for p in [PROJECT_ROOT / "test_data.jpeg", Path("/app/test_data.jpeg"), Path("test_data.jpeg")]:
+                        if p.exists():
+                            self._sample_img = cv2.imread(str(p))
+                            break
+                if self._sample_img is not None:
+                    loop_start = time.perf_counter()
+                    self._process_single_frame(self._sample_img)
+                    elapsed = time.perf_counter() - loop_start
+                    delay = (1.0 / self.target_fps) - elapsed
+                    if delay > 0:
+                        time.sleep(delay)
+                    continue
+
             if not self.is_camera_connected and not self._is_ingest_mode:
                 success = self._open_camera()
                 if not success:
@@ -299,11 +317,20 @@ class EdgeInferenceRuntime:
             if target_delay > 0:
                 time.sleep(target_delay)
 
+    def toggle_simulation(self) -> bool:
+        """Toggles container-internal sample frame loop without external bridges."""
+        self.simulation_active = not self.simulation_active
+        if self.simulation_active:
+            self.is_camera_connected = True
+            CAMERA_CONNECTED.set(1)
+        return self.simulation_active
+
     def feed_frame(self, frame_bgr: np.ndarray) -> Dict:
         """
         External ingestion entry point.
         Allows host webcam bridges to push frames directly into the runtime.
         """
+        self.simulation_active = False  # Real frame received, pause simulation
         self.is_camera_connected = True
         CAMERA_CONNECTED.set(1)
         return self._process_single_frame(frame_bgr)

@@ -167,9 +167,22 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <input type="range" id="area-slider" min="50" max="1500" value="300" step="50" oninput="onAreaChange(this.value)">
       </div>
 
+      <!-- Action Buttons: Zero Host Installs Needed! -->
+      <div style="display: flex; flex-direction: column; gap: 0.5rem; margin-top: 1rem;">
+        <button id="btn-webcam" onclick="toggleBrowserCamera()" style="width: 100%; padding: 0.65rem; background: #238636; color: white; border: none; border-radius: 4px; font-weight: bold; font-size: 0.85rem; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 0.5rem; transition: background 0.2s;">
+          📹 Stream Browser Webcam (0 Installs)
+        </button>
+        <button id="btn-sim" onclick="toggleInternalSim()" style="width: 100%; padding: 0.65rem; background: #1f6feb; color: white; border: none; border-radius: 4px; font-weight: bold; font-size: 0.85rem; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 0.5rem; transition: background 0.2s;">
+          ⚡ Run In-Container Test Stream
+        </button>
+      </div>
+
       <div style="margin-top: 0.8rem; font-size: 0.75rem; color: #7f8c9b;">
         <span>Camera Source: </span>
         <strong id="val-cam" style="color: #00e676;">Connecting...</strong>
+        <p style="font-size: 0.70rem; margin-top: 0.4rem; color: #8b949e;">
+          <strong>No separate scripts needed:</strong> Click <em>Stream Browser Webcam</em> to stream your webcam directly, or click <em>Run In-Container Test Stream</em> to simulate continuous feed.
+        </p>
       </div>
     </div>
   </div>
@@ -248,6 +261,88 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       } catch (e) {}
     }
     setInterval(updateTelemetry, 400);
+
+    // 4. In-Browser Webcam Streaming (Direct to K8s Pod without Terminal Script)
+    let localStream = null;
+    let streamActive = false;
+    let isSending = false;
+    const hiddenVideo = document.createElement('video');
+    hiddenVideo.autoplay = true;
+    hiddenVideo.playsInline = true;
+    hiddenVideo.muted = true;
+    const hiddenCanvas = document.createElement('canvas');
+    hiddenCanvas.width = 640;
+    hiddenCanvas.height = 480;
+    const ctx = hiddenCanvas.getContext('2d');
+
+    async function toggleBrowserCamera() {
+      const btn = document.getElementById('btn-webcam');
+      if (!streamActive) {
+        try {
+          localStream = await navigator.mediaDevices.getUserMedia({
+            video: { width: { ideal: 640 }, height: { ideal: 480 } }
+          });
+          hiddenVideo.srcObject = localStream;
+          await hiddenVideo.play();
+          streamActive = true;
+          btn.innerText = '⏹ Stop Streaming Webcam';
+          btn.style.background = '#da3633';
+          sendFramesLoop();
+        } catch (err) {
+          alert('Could not access webcam: ' + err.message + '\\nPlease grant camera permissions or use python scripts/camera_bridge.py.');
+        }
+      } else {
+        streamActive = false;
+        if (localStream) {
+          localStream.getTracks().forEach(track => track.stop());
+          localStream = null;
+        }
+        btn.innerText = '📹 Stream Host Webcam Directly';
+        btn.style.background = '#238636';
+      }
+    }
+
+    function sendFramesLoop() {
+      if (!streamActive) return;
+      if (!isSending) {
+        isSending = true;
+        ctx.drawImage(hiddenVideo, 0, 0, hiddenCanvas.width, hiddenCanvas.height);
+        hiddenCanvas.toBlob(async (blob) => {
+          if (blob && streamActive) {
+            try {
+              await fetch('/api/feed', {
+                method: 'POST',
+                body: blob,
+                headers: { 'Content-Type': 'application/octet-stream' }
+              });
+            } catch (e) {}
+          }
+          isSending = false;
+          if (streamActive) setTimeout(sendFramesLoop, 65); // ~15 FPS
+        }, 'image/jpeg', 0.80);
+      } else {
+        setTimeout(sendFramesLoop, 20);
+      }
+    }
+    // 5. In-Container Direct Simulation (Zero Installs Anywhere!)
+    let simActive = false;
+    async function toggleInternalSim() {
+      const btn = document.getElementById('btn-sim');
+      try {
+        const res = await fetch('/api/simulate', { method: 'POST' });
+        const d = await res.json();
+        simActive = d.simulation_active;
+        if (simActive) {
+          btn.innerText = '⏹ Stop In-Container Test Stream';
+          btn.style.background = '#da3633';
+        } else {
+          btn.innerText = '⚡ Run In-Container Test Stream';
+          btn.style.background = '#1f6feb';
+        }
+      } catch (e) {
+        alert('Could not toggle simulation: ' + e.message);
+      }
+    }
   </script>
 </body>
 </html>
@@ -310,6 +405,16 @@ def update_config(
         "threshold": runtime.threshold,
         "min_contour_area": runtime.min_contour_area
     }
+
+
+@app.post("/api/simulate")
+def toggle_simulation():
+    """Toggles container-internal sample frame loop without any external bridges."""
+    if runtime is None:
+        raise HTTPException(status_code=503, detail="Runtime not initialized")
+    active = runtime.toggle_simulation()
+    INFERENCE_REQUESTS.labels(endpoint="/api/simulate", http_status="200").inc()
+    return {"status": "success", "simulation_active": active}
 
 
 def generate_mjpeg_stream():
