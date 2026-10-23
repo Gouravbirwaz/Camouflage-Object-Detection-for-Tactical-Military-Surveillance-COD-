@@ -22,10 +22,17 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.api.metrics import (
     CAMERA_CONNECTED,
+    CONFIDENCE_THRESHOLD,
+    DETECTION_ACTIVE,
+    DETECTION_CONFIDENCE,
+    E2E_DURATION,
+    FEED_MODE,
     FRAMES_PROCESSED,
     INFERENCE_DURATION,
     INFERENCE_ERRORS,
+    MASK_PIXEL_COVERAGE,
     MODEL_READY,
+    OBJECTS_DETECTED,
     fps_monitor,
     update_uptime,
 )
@@ -74,10 +81,15 @@ class EdgeInferenceRuntime:
         self.cap = None
         self.is_camera_connected = False
         self.last_camera_error = ""
-        self._is_ingest_mode = False
+        source_str = str(self.camera_source).strip().lower()
+        self._is_ingest_mode = source_str in {"ingest", "bridge", "none"}
+        self._last_external_frame_time = 0.0
         self._stop_event = threading.Event()
         self._worker_thread: Optional[threading.Thread] = None
         self._frame_lock = threading.Lock()
+
+        # Initialize Gauge
+        CONFIDENCE_THRESHOLD.set(round(self.threshold, 2))
 
         # Bounded frame buffer
         self._latest_raw_frame: Optional[np.ndarray] = None
@@ -104,6 +116,7 @@ class EdgeInferenceRuntime:
         """Dynamically updates the confidence threshold from the user interface."""
         val = max(0.01, min(0.99, float(threshold)))
         self.threshold = val
+        CONFIDENCE_THRESHOLD.set(round(val, 2))
         print(f"[Runtime Config] Confidence threshold dynamically updated to: {val:0.2f}")
 
     def set_min_contour_area(self, area: int):
@@ -113,8 +126,9 @@ class EdgeInferenceRuntime:
         print(f"[Runtime Config] Min contour area updated to: {val} px")
 
     def start(self):
-        """Loads model and starts background continuous inference loop."""
+        """Loads model, initializes camera negotiation, and starts continuous inference loop."""
         self._load_model()
+        self._open_camera()
         self._worker_thread = threading.Thread(
             target=self._continuous_inference_loop,
             name="EdgeInferenceWorker",
@@ -264,13 +278,47 @@ class EdgeInferenceRuntime:
         reconnect_delay = 1.0
 
         while not self._stop_event.is_set():
+            # Check if external feed is active
+            has_live_feed = (time.time() - self._last_external_frame_time) < 2.5
+
+            # If ingest mode is active:
+            if self._is_ingest_mode:
+                if has_live_feed:
+                    FEED_MODE.set(1)  # Live external feed active
+                    time.sleep(0.02)
+                    continue
+                else:
+                    # Autonomous simulation active so Prometheus & Grafana always have live telemetry!
+                    FEED_MODE.set(2)
+                    CAMERA_CONNECTED.set(1)
+                    if self._sample_img is None:
+                        for p in [PROJECT_ROOT / "test_data.jpeg", Path("/app/test_data.jpeg"), Path("test_data.jpeg")]:
+                            if p.exists():
+                                self._sample_img = cv2.imread(str(p))
+                                break
+                        if self._sample_img is None:
+                            self._sample_img = np.zeros((384, 384, 3), dtype=np.uint8)
+                            cv2.circle(self._sample_img, (192, 192), 60, (120, 150, 130), -1)
+
+                    loop_start = time.perf_counter()
+                    self._process_single_frame(self._sample_img)
+                    elapsed = time.perf_counter() - loop_start
+                    delay = (1.0 / min(self.target_fps, 10.0)) - elapsed
+                    if delay > 0:
+                        time.sleep(delay)
+                    continue
+
             # Internal simulation loop for zero-dependency container test streaming
             if self.simulation_active:
+                FEED_MODE.set(2)
                 if self._sample_img is None:
                     for p in [PROJECT_ROOT / "test_data.jpeg", Path("/app/test_data.jpeg"), Path("test_data.jpeg")]:
                         if p.exists():
                             self._sample_img = cv2.imread(str(p))
                             break
+                    if self._sample_img is None:
+                        self._sample_img = np.zeros((384, 384, 3), dtype=np.uint8)
+                        cv2.circle(self._sample_img, (192, 192), 60, (120, 150, 130), -1)
                 if self._sample_img is not None:
                     loop_start = time.perf_counter()
                     self._process_single_frame(self._sample_img)
@@ -289,10 +337,6 @@ class EdgeInferenceRuntime:
                 else:
                     reconnect_delay = 1.0
 
-            if self._is_ingest_mode:
-                time.sleep(0.02)
-                continue
-
             loop_start = time.perf_counter()
             ret, frame = False, None
             if self.cap is not None and self.cap.isOpened():
@@ -310,6 +354,7 @@ class EdgeInferenceRuntime:
                 time.sleep(1.0)
                 continue
 
+            FEED_MODE.set(1)
             self._process_single_frame(frame)
 
             elapsed = time.perf_counter() - loop_start
@@ -330,13 +375,16 @@ class EdgeInferenceRuntime:
         External ingestion entry point.
         Allows host webcam bridges to push frames directly into the runtime.
         """
+        self._last_external_frame_time = time.time()
         self.simulation_active = False  # Real frame received, pause simulation
         self.is_camera_connected = True
+        FEED_MODE.set(1)
         CAMERA_CONNECTED.set(1)
         return self._process_single_frame(frame_bgr)
 
     def _process_single_frame(self, frame_bgr: np.ndarray) -> Dict:
         """Preprocesses frame, executes forward pass, postprocesses, and updates buffers."""
+        t_e2e_start = time.perf_counter()
         try:
             orig_h, orig_w = frame_bgr.shape[:2]
             target_h, target_w = self.target_size
@@ -367,6 +415,14 @@ class EdgeInferenceRuntime:
             obj_pixels = int(np.count_nonzero(mask_2d > 0))
             detected = bool(obj_pixels > 0)
 
+            # Update Telemetry & Detection Metrics
+            DETECTION_ACTIVE.set(1.0 if detected else 0.0)
+            DETECTION_CONFIDENCE.set(round(max_conf, 4))
+            MASK_PIXEL_COVERAGE.set(obj_pixels)
+            CONFIDENCE_THRESHOLD.set(round(self.threshold, 2))
+            if detected:
+                OBJECTS_DETECTED.inc()
+
             # 4. Render visualization overlay with active threshold
             annotated = self._render_tactical_hud(
                 frame_bgr, mask_2d, detected, max_conf, inf_ms, obj_pixels
@@ -380,6 +436,8 @@ class EdgeInferenceRuntime:
             # 6. Update thread-safe bounded buffers
             fps = fps_monitor.record_frame()
             update_uptime()
+            e2e_sec = time.perf_counter() - t_e2e_start
+            E2E_DURATION.observe(e2e_sec)
             FRAMES_PROCESSED.labels(model_type=self.model_type, status="success").inc()
 
             telemetry = {
