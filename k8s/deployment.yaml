@@ -30,7 +30,7 @@ spec:
         fsGroup: 10001
       containers:
         - name: inference
-          image: gourav1310/edge-ai-inference:latest
+          image: gourav1310/edge-ai-inference:sha-0ab9c1e
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
