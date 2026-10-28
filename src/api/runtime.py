@@ -39,6 +39,53 @@ from src.api.metrics import (
 from src.api.pipeline import edge_preprocess_frame, process_prediction_mask
 
 
+class InternalCameraGrabber:
+    """
+    Continuously grabs frames in a background thread to prevent OpenCV driver
+    buffer latency and camera I/O blocking.
+    """
+    def __init__(self, cap: cv2.VideoCapture):
+        self.cap = cap
+        self.lock = threading.Lock()
+        self.running = True
+        self.has_frame = False
+        self.latest_frame: Optional[np.ndarray] = None
+        self.consecutive_errors = 0
+        self.thread = threading.Thread(target=self._worker, name="InternalCameraGrabber", daemon=True)
+        self.thread.start()
+
+    def _worker(self):
+        while self.running:
+            try:
+                ret, frame = self.cap.read()
+                if ret and frame is not None:
+                    with self.lock:
+                        self.latest_frame = frame
+                        self.has_frame = True
+                    self.consecutive_errors = 0
+                else:
+                    self.consecutive_errors += 1
+                    time.sleep(0.01)
+            except Exception:
+                self.consecutive_errors += 1
+                time.sleep(0.01)
+
+    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
+        with self.lock:
+            if not self.has_frame or self.latest_frame is None:
+                return False, None
+            return True, self.latest_frame
+
+    def stop(self):
+        self.running = False
+        if self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+        try:
+            self.cap.release()
+        except Exception:
+            pass
+
+
 class EdgeInferenceRuntime:
     """
     Primary edge inference engine.
@@ -53,7 +100,7 @@ class EdgeInferenceRuntime:
         target_size: Tuple[int, int] = (384, 384),
         threshold: float = 0.50,
         min_contour_area: int = 300,
-        target_fps: float = 15.0
+        target_fps: float = 25.0
     ):
         self.model_path = model_path or os.getenv(
             "MODEL_PATH",
@@ -80,6 +127,7 @@ class EdgeInferenceRuntime:
 
         # Camera & Threading state
         self.cap = None
+        self.grabber: Optional[InternalCameraGrabber] = None
         self.is_camera_connected = False
         self.last_camera_error = ""
         source_str = str(self.camera_source).strip().lower()
@@ -89,6 +137,8 @@ class EdgeInferenceRuntime:
         self._worker_thread: Optional[threading.Thread] = None
         self._frame_lock = threading.Lock()
         self._inference_lock = threading.Lock()
+        self._incoming_lock = threading.Lock()
+        self._latest_incoming_frame: Optional[np.ndarray] = None
 
         # Initialize Gauge
         CONFIDENCE_THRESHOLD.set(round(self.threshold, 2))
@@ -236,22 +286,26 @@ class EdgeInferenceRuntime:
         system = platform.system().lower()
         cap = None
 
-        if idx is not None:
-            if "linux" in system:
-                cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
-                if not cap.isOpened():
-                    cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
-                if not cap.isOpened():
-                    cap = cv2.VideoCapture(idx)
-            elif "windows" in system:
-                cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-                if not cap.isOpened():
+        try:
+            if idx is not None:
+                if "linux" in system:
+                    cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+                    if not cap.isOpened():
+                        cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
+                    if not cap.isOpened():
+                        cap = cv2.VideoCapture(idx)
+                elif "windows" in system:
+                    cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                    if not cap.isOpened():
+                        cap = cv2.VideoCapture(idx)
+                else:
                     cap = cv2.VideoCapture(idx)
             else:
-                cap = cv2.VideoCapture(idx)
-        else:
-            # RTSP, HTTP, or video file stream
-            cap = cv2.VideoCapture(source)
+                # RTSP, HTTP, or video file stream
+                cap = cv2.VideoCapture(source)
+        except Exception as exc:
+            print(f"[Runtime Warning] Camera hardware negotiation failed: {exc}")
+            cap = None
 
         if cap is not None and cap.isOpened():
             # Configure frame negotiation for low-latency edge streaming
@@ -260,21 +314,30 @@ class EdgeInferenceRuntime:
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             self.cap = cap
+            self.grabber = InternalCameraGrabber(cap)
             self.is_camera_connected = True
             self.last_camera_error = ""
             CAMERA_CONNECTED.set(1)
-            print(f"[Runtime] Camera hardware '{source}' successfully opened.")
+            print(f"[Runtime] Camera hardware '{source}' successfully opened with threaded grabber.")
             return True
 
         self.is_camera_connected = False
-        self.last_camera_error = f"Hardware camera '{source}' not accessible inside this container. Ingest endpoint (/api/feed) is active and awaiting frames."
-        self._is_ingest_mode = True  # Seamless fallback to ingest mode
+        self.last_camera_error = (
+            f"Hardware camera '{source}' not accessible inside this environment. "
+            "Autonomous zero-dependency fallback active; ingest endpoint (/api/feed) is ready."
+        )
         CAMERA_CONNECTED.set(0)
         print(f"[Runtime Notice] {self.last_camera_error}")
         return False
 
     def _close_camera(self):
-        """Safely releases the camera handle."""
+        """Safely releases the camera handle and background grabber thread."""
+        if self.grabber is not None:
+            try:
+                self.grabber.stop()
+            except Exception:
+                pass
+            self.grabber = None
         if self.cap is not None:
             try:
                 self.cap.release()
@@ -286,92 +349,72 @@ class EdgeInferenceRuntime:
 
     def _continuous_inference_loop(self):
         """Continuous background inference loop decoupled from HTTP requests."""
-        reconnect_delay = 1.0
+        last_reconnect_attempt = time.time()
 
         while not self._stop_event.is_set():
-            # Check if external feed is active
-            has_live_feed = (time.time() - self._last_external_frame_time) < 2.5
+            now = time.time()
+            has_live_feed = (now - self._last_external_frame_time) < 2.5
 
-            # If ingest mode is active:
-            if self._is_ingest_mode:
-                if has_live_feed:
-                    FEED_MODE.set(1)  # Live external feed active
-                    time.sleep(0.02)
-                    continue
+            # Priority 1: External feed if actively being ingested (/api/feed)
+            if has_live_feed:
+                FEED_MODE.set(1)
+                CAMERA_CONNECTED.set(1)
+                frame_to_process = None
+                with self._incoming_lock:
+                    if self._latest_incoming_frame is not None:
+                        frame_to_process = self._latest_incoming_frame
+                        self._latest_incoming_frame = None
+
+                if frame_to_process is not None:
+                    self._process_single_frame(frame_to_process)
                 else:
-                    # Autonomous simulation active so Prometheus & Grafana always have live telemetry!
-                    FEED_MODE.set(2)
-                    CAMERA_CONNECTED.set(1)
-                    if self._sample_img is None:
-                        for p in [PROJECT_ROOT / "test_data.jpeg", Path("/app/test_data.jpeg"), Path("test_data.jpeg")]:
-                            if p.exists():
-                                self._sample_img = cv2.imread(str(p))
-                                break
-                        if self._sample_img is None:
-                            self._sample_img = np.zeros((384, 384, 3), dtype=np.uint8)
-                            cv2.circle(self._sample_img, (192, 192), 60, (120, 150, 130), -1)
-
-                    loop_start = time.perf_counter()
-                    self._process_single_frame(self._sample_img)
-                    elapsed = time.perf_counter() - loop_start
-                    delay = (1.0 / min(self.target_fps, 10.0)) - elapsed
-                    if delay > 0:
-                        time.sleep(delay)
-                    continue
-
-            # Internal simulation loop for zero-dependency container test streaming
-            if self.simulation_active:
-                FEED_MODE.set(2)
-                if self._sample_img is None:
-                    for p in [PROJECT_ROOT / "test_data.jpeg", Path("/app/test_data.jpeg"), Path("test_data.jpeg")]:
-                        if p.exists():
-                            self._sample_img = cv2.imread(str(p))
-                            break
-                    if self._sample_img is None:
-                        self._sample_img = np.zeros((384, 384, 3), dtype=np.uint8)
-                        cv2.circle(self._sample_img, (192, 192), 60, (120, 150, 130), -1)
-                if self._sample_img is not None:
-                    loop_start = time.perf_counter()
-                    self._process_single_frame(self._sample_img)
-                    elapsed = time.perf_counter() - loop_start
-                    delay = (1.0 / self.target_fps) - elapsed
-                    if delay > 0:
-                        time.sleep(delay)
-                    continue
-
-            if not self.is_camera_connected and not self._is_ingest_mode:
-                success = self._open_camera()
-                if not success:
-                    time.sleep(reconnect_delay)
-                    reconnect_delay = min(reconnect_delay * 1.5, 5.0)
-                    continue
-                else:
-                    reconnect_delay = 1.0
-
-            loop_start = time.perf_counter()
-            ret, frame = False, None
-            if self.cap is not None and self.cap.isOpened():
-                try:
-                    ret, frame = self.cap.read()
-                except Exception as exc:
-                    self.last_camera_error = f"Camera read error: {exc}"
-                    ret = False
-
-            if not ret or frame is None:
-                self.is_camera_connected = False
-                self.last_camera_error = "Failed to grab frame from camera source."
-                CAMERA_CONNECTED.set(0)
-                self._close_camera()
-                time.sleep(1.0)
+                    time.sleep(0.005)
                 continue
 
-            FEED_MODE.set(1)
-            self._process_single_frame(frame)
+            # Priority 2: Direct hardware camera / RTSP stream if not explicitly 'ingest' mode
+            if not self._is_ingest_mode:
+                # If disconnected or grabber encountered repeated read failures, retry opening periodically
+                if not self.is_camera_connected or self.grabber is None or self.grabber.consecutive_errors > 15:
+                    if (now - last_reconnect_attempt) > 3.0:
+                        last_reconnect_attempt = now
+                        self._close_camera()
+                        self._open_camera()
 
+                if self.is_camera_connected and self.grabber is not None:
+                    loop_start = time.perf_counter()
+                    ret, frame = self.grabber.read()
+                    if ret and frame is not None:
+                        FEED_MODE.set(1)
+                        CAMERA_CONNECTED.set(1)
+                        self._process_single_frame(frame)
+                        elapsed = time.perf_counter() - loop_start
+                        delay = (1.0 / self.target_fps) - elapsed
+                        if delay > 0:
+                            time.sleep(delay)
+                        continue
+                    else:
+                        time.sleep(0.005)
+                        continue
+
+            # Priority 3: Autonomous simulation fallback (sample image / test pattern)
+            # Ensures zero-dependency continuous detection even before hardware camera is ready
+            FEED_MODE.set(2)
+            CAMERA_CONNECTED.set(1 if self.is_camera_connected else 0)
+            if self._sample_img is None:
+                for p in [PROJECT_ROOT / "test_data.jpeg", Path("/app/test_data.jpeg"), Path("test_data.jpeg")]:
+                    if p.exists():
+                        self._sample_img = cv2.imread(str(p))
+                        break
+                if self._sample_img is None:
+                    self._sample_img = np.zeros((384, 384, 3), dtype=np.uint8)
+                    cv2.circle(self._sample_img, (192, 192), 60, (120, 150, 130), -1)
+
+            loop_start = time.perf_counter()
+            self._process_single_frame(self._sample_img)
             elapsed = time.perf_counter() - loop_start
-            target_delay = (1.0 / self.target_fps) - elapsed
-            if target_delay > 0:
-                time.sleep(target_delay)
+            delay = (1.0 / self.target_fps) - elapsed
+            if delay > 0:
+                time.sleep(delay)
 
     def toggle_simulation(self) -> bool:
         """Toggles container-internal sample frame loop without external bridges."""
@@ -384,13 +427,19 @@ class EdgeInferenceRuntime:
     def feed_frame(self, frame_bgr: np.ndarray) -> Dict:
         """
         External ingestion entry point.
-        Allows host webcam bridges to push frames directly into the runtime.
+        Asynchronously buffers frame so the sender never blocks on inference.
         """
         self._last_external_frame_time = time.time()
         self.simulation_active = False  # Real frame received, pause simulation
         self.is_camera_connected = True
         FEED_MODE.set(1)
         CAMERA_CONNECTED.set(1)
+        with self._incoming_lock:
+            self._latest_incoming_frame = frame_bgr
+        return self.get_telemetry()
+
+    def predict_frame(self, frame_bgr: np.ndarray) -> Dict:
+        """Synchronous frame prediction for /predict endpoint."""
         return self._process_single_frame(frame_bgr)
 
     def _process_single_frame(self, frame_bgr: np.ndarray) -> Dict:

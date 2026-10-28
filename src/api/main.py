@@ -121,8 +121,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   <div class="grid">
     <div class="card">
       <div class="video-container">
-        <!-- Freeze-free dynamic frame rendered via non-blocking asynchronous pipeline -->
-        <img id="live-stream" src="/api/frame" alt="Live Tactical Feed">
+        <!-- Native, zero-overhead MJPEG video stream -->
+        <img id="live-stream" src="/stream" alt="Live Tactical Feed">
       </div>
     </div>
 
@@ -196,26 +196,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   </div>
 
   <script>
-    // 1. Freeze-Free Live Video Rendering
+    // 1. Native MJPEG Stream with Auto-Reconnect
     const streamImg = document.getElementById('live-stream');
-    let frameLoading = false;
-
-    function renderNextFrame() {
-      if (frameLoading) return;
-      frameLoading = true;
-      const nextImg = new Image();
-      nextImg.onload = () => {
-        streamImg.src = nextImg.src;
-        frameLoading = false;
-        requestAnimationFrame(renderNextFrame);
-      };
-      nextImg.onerror = () => {
-        frameLoading = false;
-        setTimeout(renderNextFrame, 150);
-      };
-      nextImg.src = '/api/frame?t=' + performance.now();
-    }
-    renderNextFrame();
+    streamImg.onerror = () => {
+      // Reconnect if stream drops or server restarts
+      setTimeout(() => {
+        streamImg.src = '/stream?t=' + performance.now();
+      }, 1000);
+    };
 
     // 2. Real-time User-Controlled Threshold (Dynamic, No Hardcoding)
     let updateTimeout = null;
@@ -419,15 +407,17 @@ def toggle_simulation():
 
 def generate_mjpeg_stream():
     """Generator yielding MJPEG multipart frames."""
+    last_jpeg = None
     while True:
         if runtime is not None:
             jpeg = runtime.get_latest_jpeg()
-            if jpeg is not None:
+            if jpeg is not None and jpeg is not last_jpeg:
+                last_jpeg = jpeg
                 yield (
                     b"--frame\r\n"
                     b"Content-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
                 )
-        time.sleep(0.04)
+        time.sleep(0.033)
 
 
 @app.get("/stream")
@@ -535,7 +525,7 @@ async def predict_endpoint(request: Request, file: Optional[UploadFile] = File(N
     if frame_bgr is None:
         raise HTTPException(status_code=400, detail="Could not decode image")
 
-    telemetry = runtime.feed_frame(frame_bgr)
+    telemetry = runtime.predict_frame(frame_bgr)
 
     jpeg = runtime.get_latest_jpeg()
     mask_b64 = base64.b64encode(jpeg).decode("utf-8") if jpeg else ""

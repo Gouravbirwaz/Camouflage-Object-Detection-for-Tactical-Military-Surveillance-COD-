@@ -1,0 +1,24 @@
+version: "3.8"
+
+services:
+  edge-ai-inference:
+    image: gourav1310/edge-ai-inference:latest
+    container_name: edge-ai-inference
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    devices:
+      - "/dev/video0:/dev/video0"
+    environment:
+      - CAMERA_SOURCE=0
+      - TARGET_FPS=25.0
+      - NUM_THREADS=4
+      - CONFIDENCE_THRESHOLD=0.50
+      - MIN_CONTOUR_AREA=300
+    # On NVIDIA Jetson or devices with GPU access, runtime: nvidia can also be specified
+    # privileged: true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

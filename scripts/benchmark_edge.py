@@ -23,8 +23,8 @@ def parse_args():
     parser.add_argument(
         "--endpoint",
         type=str,
-        default=os.getenv("EDGE_API_URL", "http://localhost:8000/predict"),
-        help="Inference API endpoint (default: http://localhost:8000/predict)"
+        default=os.getenv("EDGE_API_URL", "http://127.0.0.1:8000/predict"),
+        help="Inference API endpoint (default: http://127.0.0.1:8000/predict)"
     )
     parser.add_argument(
         "--warmup",
@@ -49,6 +49,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if "localhost" in args.endpoint:
+        args.endpoint = args.endpoint.replace("localhost", "127.0.0.1")
     print("=" * 70)
     print("      DGNet Edge AI Latency & Throughput Benchmark")
     print("=" * 70)

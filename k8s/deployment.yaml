@@ -30,7 +30,7 @@ spec:
         fsGroup: 10001
       containers:
         - name: inference
-          image: gourav1310/edge-ai-inference:sha-0ab9c1e
+          image: gourav1310/edge-ai-inference:latest
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -40,7 +40,7 @@ spec:
             - name: MODEL_PATH
               value: "/app/models/proposed_mobilenet_v3_fp16.tflite"
             - name: CAMERA_SOURCE
-              value: "ingest"
+              value: "0"
             - name: INPUT_HEIGHT
               value: "384"
             - name: INPUT_WIDTH
@@ -50,7 +50,7 @@ spec:
             - name: MIN_CONTOUR_AREA
               value: "300"
             - name: TARGET_FPS
-              value: "15.0"
+              value: "25.0"
             - name: NUM_THREADS
               value: "4"
             - name: PORT

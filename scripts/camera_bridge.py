@@ -57,8 +57,8 @@ def parse_args():
     parser.add_argument(
         "--endpoint",
         type=str,
-        default=os.getenv("EDGE_FEED_URL", "http://localhost:8000/api/feed"),
-        help="Target container ingest URL (default: http://localhost:8000/api/feed)"
+        default=os.getenv("EDGE_FEED_URL", "http://127.0.0.1:8000/api/feed"),
+        help="Target container ingest URL (default: http://127.0.0.1:8000/api/feed)"
     )
     parser.add_argument(
         "--camera-index",
@@ -87,8 +87,8 @@ def parse_args():
     parser.add_argument(
         "--fps",
         type=float,
-        default=15.0,
-        help="Target streaming FPS (default: 15.0)"
+        default=25.0,
+        help="Target streaming FPS (default: 25.0)"
     )
     return parser.parse_args()
 
@@ -119,6 +119,8 @@ def open_camera(index: int, width: int, height: int) -> Optional[cv2.VideoCaptur
 
 def main():
     args = parse_args()
+    if "localhost" in args.endpoint:
+        args.endpoint = args.endpoint.replace("localhost", "127.0.0.1")
     print("=" * 70)
     print("      DGNet Edge AI Host Camera Bridge")
     print("=" * 70)
