@@ -64,6 +64,7 @@ class EdgeInferenceRuntime:
         self.threshold = float(os.getenv("CONFIDENCE_THRESHOLD", str(threshold)))
         self.min_contour_area = int(os.getenv("MIN_CONTOUR_AREA", str(min_contour_area)))
         self.target_fps = float(os.getenv("TARGET_FPS", str(target_fps)))
+        self.num_threads = int(os.getenv("NUM_THREADS", str(min(4, os.cpu_count() or 4))))
 
         p = Path(self.model_path)
         if not p.is_absolute():
@@ -87,6 +88,7 @@ class EdgeInferenceRuntime:
         self._stop_event = threading.Event()
         self._worker_thread: Optional[threading.Thread] = None
         self._frame_lock = threading.Lock()
+        self._inference_lock = threading.Lock()
 
         # Initialize Gauge
         CONFIDENCE_THRESHOLD.set(round(self.threshold, 2))
@@ -177,7 +179,15 @@ class EdgeInferenceRuntime:
             MODEL_READY.set(0)
             raise RuntimeError("No compatible TFLite runtime found (ai_edge_litert, tflite_runtime, or tensorflow.lite).")
 
-        interpreter = Interpreter(model_path=str(self.resolved_model_path))
+        try:
+            interpreter = Interpreter(
+                model_path=str(self.resolved_model_path),
+                num_threads=self.num_threads
+            )
+        except TypeError:
+            interpreter = Interpreter(model_path=str(self.resolved_model_path))
+        print(f"[Runtime] Initialized TFLite interpreter with {self.num_threads} worker threads.")
+
         interpreter.allocate_tensors()
         self.interpreter = interpreter
         self.input_details = interpreter.get_input_details()
@@ -196,10 +206,11 @@ class EdgeInferenceRuntime:
         print("[Runtime] Model validation and warm-up successful. Engine is READY.")
 
     def _run_forward_pass(self, input_tensor: np.ndarray) -> np.ndarray:
-        """Executes raw forward pass through TFLite interpreter."""
-        self.interpreter.set_tensor(self.input_details[0]["index"], input_tensor)
-        self.interpreter.invoke()
-        pred = self.interpreter.get_tensor(self.output_details[0]["index"])
+        """Executes thread-safe raw forward pass through TFLite interpreter."""
+        with self._inference_lock:
+            self.interpreter.set_tensor(self.input_details[0]["index"], input_tensor)
+            self.interpreter.invoke()
+            pred = self.interpreter.get_tensor(self.output_details[0]["index"])
         if pred.ndim == 4:
             return pred[0]
         return pred

@@ -324,7 +324,11 @@ class ModelRunner:
             except Exception as e:
                 print(f"       Notice: Partial weight load for {self.info['name']} ({e})")
         elif self.model_type == "tflite":
-            interpreter = tf.lite.Interpreter(model_path=self.path)
+            num_threads = int(os.getenv("NUM_THREADS", str(min(4, os.cpu_count() or 4))))
+            try:
+                interpreter = tf.lite.Interpreter(model_path=self.path, num_threads=num_threads)
+            except TypeError:
+                interpreter = tf.lite.Interpreter(model_path=self.path)
             interpreter.allocate_tensors()
             self.loaded_model = interpreter
         elif self.model_type == "onnx":

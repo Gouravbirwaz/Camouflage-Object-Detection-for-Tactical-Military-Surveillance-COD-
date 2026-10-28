@@ -51,16 +51,18 @@ spec:
               value: "300"
             - name: TARGET_FPS
               value: "15.0"
+            - name: NUM_THREADS
+              value: "4"
             - name: PORT
               value: "8000"
             - name: HOST
               value: "0.0.0.0"
           resources:
             requests:
-              cpu: "500m"
+              cpu: "1000m"
               memory: "512Mi"
             limits:
-              cpu: "2000m"
+              cpu: "4000m"
               memory: "2560Mi"
           livenessProbe:
             httpGet:

@@ -9,11 +9,47 @@ import argparse
 import os
 import platform
 import sys
+import threading
 import time
 from typing import Optional
 
 import cv2
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+class ThreadedCameraGrabber:
+    """Continuously grabs frames in a background thread to prevent camera I/O blocking."""
+    def __init__(self, cap: cv2.VideoCapture):
+        self.cap = cap
+        self.lock = threading.Lock()
+        self.running = True
+        self.has_frame = False
+        self.latest_frame: Optional[cv2.Mat] = None
+        self.thread = threading.Thread(target=self._worker, name="CameraGrabber", daemon=True)
+        self.thread.start()
+
+    def _worker(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if ret and frame is not None:
+                with self.lock:
+                    self.latest_frame = frame
+                    self.has_frame = True
+            else:
+                time.sleep(0.005)
+
+    def read(self):
+        with self.lock:
+            if not self.has_frame or self.latest_frame is None:
+                return False, None
+            return True, self.latest_frame
+
+    def stop(self):
+        self.running = False
+        if self.thread.is_alive():
+            self.thread.join(timeout=1.0)
 
 
 def parse_args():
@@ -102,23 +138,35 @@ def main():
         print("[TIP] For testing without physical camera, pass --video-source test_data.jpeg")
         sys.exit(1)
 
+    grabber: Optional[ThreadedCameraGrabber] = None
+    if not is_file:
+        grabber = ThreadedCameraGrabber(cap)
+        print("[Bridge] Threaded non-blocking camera grabber initialized.")
+
     print("\n[Bridge] Streaming frames to container. Press Ctrl+C to stop.\n")
     session = requests.Session()
+    adapter = HTTPAdapter(pool_connections=1, pool_maxsize=10)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+
     delay = 1.0 / args.fps
-    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), 75]
     frame_count = 0
     t_start = time.time()
 
     try:
         while True:
             t0 = time.perf_counter()
-            ret, frame = cap.read()
+            if grabber is not None:
+                ret, frame = grabber.read()
+            else:
+                ret, frame = cap.read()
 
             if not ret or frame is None:
                 if is_file:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     continue
-                time.sleep(0.1)
+                time.sleep(0.01)
                 continue
 
             success, jpeg_buf = cv2.imencode(".jpg", frame, encode_params)
@@ -158,6 +206,8 @@ def main():
     except KeyboardInterrupt:
         print("\n[Bridge] Stopped by user.")
     finally:
+        if grabber is not None:
+            grabber.stop()
         cap.release()
         print("[Bridge] Camera released.")
 
