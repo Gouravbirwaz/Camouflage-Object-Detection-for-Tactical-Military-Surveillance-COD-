@@ -4,15 +4,7 @@ Root package providing models, data processing, training, inference, optimizatio
 tracking, visualization, and cloud integration modules.
 """
 
-from . import utils
-from . import data
-from . import models
-from . import training
-from . import inference
-from . import optimization
-from . import visualization
-from . import tracking
-from . import integration
+import importlib
 
 __version__ = "2.0.0"
 
@@ -26,4 +18,11 @@ __all__ = [
     "visualization",
     "tracking",
     "integration",
+    "api",
 ]
+
+
+def __getattr__(name: str):
+    if name in __all__:
+        return importlib.import_module(f".{name}", __name__)
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")

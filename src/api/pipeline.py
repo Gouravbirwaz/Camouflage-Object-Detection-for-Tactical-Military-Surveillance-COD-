@@ -10,6 +10,8 @@ import numpy as np
 # Exact ImageNet statistics required by the trained DGNet model
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+_MULT = (1.0 / (255.0 * _IMAGENET_STD)).astype(np.float32)
+_BIAS = (-_IMAGENET_MEAN / _IMAGENET_STD).astype(np.float32)
 
 
 def edge_preprocess_frame(
@@ -18,15 +20,16 @@ def edge_preprocess_frame(
 ) -> np.ndarray:
     """
     Preprocess BGR OpenCV frame for DGNet inference:
-    1. BGR -> RGB
-    2. Resize to model dimensions (384, 384)
-    3. Normalize [0, 1] and apply ImageNet mean/std
-    4. Expand batch dimension -> [1, 384, 384, 3] float32
+    1. Resize directly to model dimensions (384, 384)
+    2. Convert BGR -> RGB
+    3. Fast vectorized normalization using precomputed ImageNet multipliers
     """
-    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    resized = cv2.resize(rgb, (target_size[1], target_size[0])).astype(np.float32)
-    normalized = (resized / 255.0 - _IMAGENET_MEAN) / _IMAGENET_STD
-    return np.expand_dims(normalized, axis=0).astype(np.float32)
+    resized = cv2.resize(frame_bgr, (target_size[1], target_size[0]), interpolation=cv2.INTER_LINEAR)
+    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    tensor = np.empty((1, target_size[0], target_size[1], 3), dtype=np.float32)
+    np.multiply(rgb, _MULT, out=tensor[0])
+    np.add(tensor[0], _BIAS, out=tensor[0])
+    return tensor
 
 
 def process_prediction_mask(
